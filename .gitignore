@@ -1,0 +1,24 @@
+.venv/
+.codex
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local artifacts
+*.log
+*.tmp
+dist/
+
+# Windows download metadata
+*:Zone.Identifier
+
+# Huge datasets / replays (keep out of git; archive optionally)
+replay/
+
+# Scratch / screenshots (dev notes)
+TEST*.bmp
+TEST*.png
+dutching_*.jpg
