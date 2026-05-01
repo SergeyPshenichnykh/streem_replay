@@ -278,6 +278,7 @@ def main():
     ap.add_argument("--abs-tol", type=float, default=2.0)
     ap.add_argument("--min-action-amount", type=float, default=1.0)
     ap.add_argument("--top-n-links", type=int, default=5)
+    ap.add_argument("--no-links", action="store_true")
     args = ap.parse_args()
 
     input_path = Path(args.input)
@@ -444,22 +445,27 @@ def main():
         "amount_diff", "amount_rel_diff",
     ]
 
-    links = build_links(
-        action_rows,
-        latency_sec=args.latency_sec,
-        rel_tol=args.rel_tol,
-        abs_tol=args.abs_tol,
-        top_n=args.top_n_links,
-    )
-
     write_csv(out_dir / "price_level_delta.csv", delta_rows, delta_fields)
     write_csv(out_dir / "action_log.csv", action_rows, action_fields)
-    write_csv(out_dir / f"window_links_{int(args.latency_sec)}s.csv", links, link_fields)
+
+    links = []
+    if not args.no_links:
+        links = build_links(
+            action_rows,
+            latency_sec=args.latency_sec,
+            rel_tol=args.rel_tol,
+            abs_tol=args.abs_tol,
+            top_n=args.top_n_links,
+        )
+        write_csv(out_dir / f"window_links_{int(args.latency_sec)}s.csv", links, link_fields)
 
     print("DONE")
     print(f"delta:   {out_dir / 'price_level_delta.csv'}")
     print(f"actions: {out_dir / 'action_log.csv'}")
-    print(f"links:   {out_dir / f'window_links_{int(args.latency_sec)}s.csv'}")
+    if args.no_links:
+        print("links:   SKIPPED")
+    else:
+        print(f"links:   {out_dir / f'window_links_{int(args.latency_sec)}s.csv'}")
     print(f"delta_rows={len(delta_rows)} action_rows={len(action_rows)} links={len(links)}")
 
 
