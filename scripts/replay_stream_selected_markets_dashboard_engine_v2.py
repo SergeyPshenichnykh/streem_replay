@@ -569,6 +569,17 @@ def parse_args() -> argparse.Namespace:
         default="replay/delta_10s_macro_min10/filtered_shadow_bot_v2_no_asian.csv",
         help="CSV with V2 shadow orders.",
     )
+    p.add_argument(
+        "--engine-v2-show-markets",
+        action="store_true",
+        help="Show extra ladder columns for markets used by ENGINE V2 orders.",
+    )
+    p.add_argument(
+        "--engine-v2-max-ladders",
+        type=int,
+        default=3,
+        help="Maximum ENGINE V2 ladder columns shown on pause.",
+    )
     return p.parse_args()
 
 
@@ -1467,6 +1478,19 @@ def _render_dashboard_printing(
         )
         print("\033[4;1H", end="")
 
+    _engine_v2_render_ladders_if_needed(
+        pt=int(pt),
+        markets=markets,
+        order_model=order_model,
+        show_queue=show_queue,
+        center_mode=center_mode,
+        ticks_above=ticks_above,
+        ticks_below=ticks_below,
+        ladder_max_rows=ladder_max_rows,
+        col_width=col_width,
+        paused=paused,
+    )
+
     if list_totals:
         # Print all totals (Over/Under Goals) markets at this frame, then exit.
         def fmt_best(r: RunnerState) -> tuple[str, str]:
@@ -2182,6 +2206,133 @@ def _engine_v2_find_runner(
     return None, None
 
 
+def _engine_v2_render_ladders_if_needed(
+    *,
+    pt: int,
+    markets: dict[str, MarketState],
+    order_model: OrderModel,
+    show_queue: bool,
+    center_mode: str,
+    ticks_above: int,
+    ticks_below: int,
+    ladder_max_rows: int,
+    col_width: int,
+    paused: bool = False,
+) -> None:
+    if not bool(globals().get("ENGINE_V2_SHOW_MARKETS", False)):
+        return
+
+    # Do not redraw variable-size V2 ladder block while stream is running.
+    # This prevents dashboard jumping. Press PAUSE to inspect V2 ladders.
+    if not paused:
+        return
+
+    orders = globals().get("ENGINE_V2_RUNTIME_ORDERS", [])
+    if not orders:
+        return
+
+    allowed = {
+        "MATCH_ODDS",
+        "OVER_UNDER_15",
+        "OVER_UNDER_25",
+        "OVER_UNDER_35",
+        "OVER_UNDER_45",
+        "TOTAL_GOALS",
+        "TEAM_TOTAL_GOALS",
+        "FIRST_HALF_GOALS_05",
+    }
+
+    cols: list[list[str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for r in orders:
+        mt = str(r.get("market_type") or "")
+        if mt not in allowed:
+            continue
+
+        entry = int(r.get("_entry_ms") or 0)
+        fill = int(r.get("_fill_ms") or 0)
+        exit_ms = int(r.get("_exit_ms") or 0)
+
+        if entry <= 0:
+            continue
+
+        # Show shortly before entry, while active, and shortly after exit.
+        end_ms = exit_ms if exit_ms else (fill if fill else entry + 60000)
+        if not (entry - 10000 <= pt <= end_ms + 5000):
+            continue
+
+        st, runner = _engine_v2_find_runner(markets=markets, row=r)
+        if st is None or runner is None:
+            continue
+
+        price = float(r.get("_price") or r.get("price") or 0.0)
+        if price <= 1.0:
+            continue
+
+        key = (
+            str(r.get("market_type") or ""),
+            str(r.get("market_name") or ""),
+            str(r.get("runner_name") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if pt < entry:
+            status = "NEXT"
+        elif fill and pt >= fill and (not exit_ms or pt < exit_ms):
+            status = "FILLED"
+        elif exit_ms and pt >= exit_ms:
+            status = "EXIT"
+        else:
+            status = "LIVE"
+
+        side = str(r.get("entry_order_side") or "")
+        stake = float(r.get("_stake") or r.get("stake") or 0.0)
+        if side == "LAY":
+            liab = stake * max(0.0, price - 1.0)
+        elif side == "BACK":
+            liab = stake
+        else:
+            liab = 0.0
+
+        lo = max(1.01, price - 0.25)
+        hi = price + 0.25
+
+        title = (
+            f"ENGINE_V2 {status} S{r.get('signal_id')} "
+            f"{mt} {side}@{price:g} stake={stake:g} liab={liab:.2f}"
+        )
+
+        ladder_lines = render_runner_ladder(
+            runner,
+            market_id=st.market_id,
+            center_mode=center_mode,
+            ticks_above=ticks_above,
+            ticks_below=ticks_below,
+            nonempty_only=False,
+            max_rows=int(ladder_max_rows or 12),
+            my_col_width=5,
+            order_model=order_model,
+            show_queue=show_queue,
+            price_low=lo,
+            price_high=hi,
+        )
+
+        cols.append([title] + ladder_lines)
+
+        if len(cols) >= int(globals().get("ENGINE_V2_MAX_LADDERS", 3)):
+            break
+
+    if not cols:
+        return
+
+    print()
+    print("ENGINE V2 LADDERS")
+    print_columns(cols, col_width=max(42, int(col_width)), gap="  ")
+    print("-" * 110)
+
 def _engine_v2_current_locked_and_pnl(
     *,
     orders: list[dict[str, object]],
@@ -2356,6 +2507,9 @@ def update_order_model_from_current_ladder(
 
 ENGINE_V2_OVERLAY_LINE = ""
 ENGINE_V2_TAPE_LINE = ""
+ENGINE_V2_RUNTIME_ORDERS = []
+ENGINE_V2_SHOW_MARKETS = False
+ENGINE_V2_MAX_LADDERS = 3
 
 def _engine_v2_ts_ms(s: str) -> int:
     from datetime import datetime
@@ -2560,6 +2714,10 @@ def stream_replay(args: argparse.Namespace) -> int:
     engine_v2_orders = []
     if bool(getattr(args, "engine_v2_overlay", False)):
         engine_v2_orders = _engine_v2_load_orders(str(getattr(args, "engine_v2_orders", "")))
+
+    globals()["ENGINE_V2_RUNTIME_ORDERS"] = engine_v2_orders
+    globals()["ENGINE_V2_SHOW_MARKETS"] = bool(getattr(args, "engine_v2_show_markets", False))
+    globals()["ENGINE_V2_MAX_LADDERS"] = max(1, int(getattr(args, "engine_v2_max_ladders", 3)))
 
     seeded_under_lay_grid: set[tuple[str, int, float | None, float]] = set()
     frames = 0
@@ -2836,20 +2994,19 @@ def stream_replay(args: argparse.Namespace) -> int:
                         order_model=order_model,
                     )
 
-                    global ENGINE_V2_OVERLAY_LINE
                     if bool(getattr(args, "engine_v2_overlay", False)):
-                        ENGINE_V2_OVERLAY_LINE = _engine_v2_overlay_line(
+                        globals()["ENGINE_V2_OVERLAY_LINE"] = _engine_v2_overlay_line(
                             pt=int(next_frame_pt),
                             balance=balance,
                             orders=engine_v2_orders,
                         )
-                        ENGINE_V2_TAPE_LINE = _engine_v2_tape_line(
+                        globals()["ENGINE_V2_TAPE_LINE"] = _engine_v2_tape_line(
                             pt=int(next_frame_pt),
                             orders=engine_v2_orders,
                         )
                     else:
-                        ENGINE_V2_OVERLAY_LINE = ""
-                        ENGINE_V2_TAPE_LINE = ""
+                        globals()["ENGINE_V2_OVERLAY_LINE"] = ""
+                        globals()["ENGINE_V2_TAPE_LINE"] = ""
 
                     if args.emit_json:
                         payload = build_emit_json_frame(
