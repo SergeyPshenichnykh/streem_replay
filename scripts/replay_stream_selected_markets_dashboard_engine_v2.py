@@ -29,6 +29,7 @@ if str(_ROOT) not in sys.path:
 from bot.dutching import calc_dutching  # noqa: E402
 from bot.order_model import OrderModel  # noqa: E402
 from bot.order_model import MyOrdersAtPrice  # noqa: E402
+from bot.order_model import V3Order  # noqa: E402
 
 from replay_stream_match_odds_correct import (
     DEFAULT_REPLAY_FILE,
@@ -2276,6 +2277,114 @@ def _engine_v2_log_event(
             "pnl_status": row.get("pnl_status", ""),
             "note": note,
         })
+
+
+def _engine_v3_order_key(order: V3Order) -> tuple[str, int, float | None, float, str]:
+    return (
+        order.market_id,
+        int(order.selection_id),
+        order.handicap,
+        float(order.price),
+        str(order.side),
+    )
+
+
+def _engine_v3_order_liability(order: V3Order) -> float:
+    return order.exposure()
+
+
+def _engine_v3_log_event(
+    *,
+    event: str,
+    pt: int,
+    order: V3Order,
+    signal_id: str = "",
+    liability: float | None = None,
+    free_balance: float = 0.0,
+    note: str = "",
+) -> None:
+    import csv
+    from pathlib import Path
+    from datetime import datetime, timezone
+
+    path = str(
+        globals().get("ENGINE_V3_EXEC_LOG_PATH")
+        or "replay/delta_10s_macro_min10/engine_v3_execution_log.csv"
+    )
+    if not path:
+        return
+
+    event_key = (
+        event,
+        str(order.order_id),
+        int(pt),
+        str(order.status.value),
+        f"{float(order.matched):.12f}",
+        f"{float(order.remaining):.12f}",
+        note,
+    )
+
+    logged = globals().setdefault("ENGINE_V3_LOGGED_EVENTS", set())
+    if event_key in logged:
+        return
+    logged.add(event_key)
+
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    write_header = not p.exists() or p.stat().st_size == 0
+
+    fields = [
+        "event",
+        "pt",
+        "utc",
+        "order_id",
+        "signal_id",
+        "market_type",
+        "market_name",
+        "runner_name",
+        "side",
+        "price",
+        "stake",
+        "matched",
+        "remaining",
+        "queue_ahead_initial",
+        "queue_ahead_remaining",
+        "status",
+        "liability",
+        "free_balance",
+        "note",
+    ]
+
+    utc = datetime.fromtimestamp(pt / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    liab = _engine_v3_order_liability(order) if liability is None else float(liability)
+
+    with p.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        if write_header:
+            w.writeheader()
+        w.writerow({
+            "event": event,
+            "pt": pt,
+            "utc": utc,
+            "order_id": order.order_id,
+            "signal_id": signal_id,
+            "market_type": order.market_type or "",
+            "market_name": order.market_name or "",
+            "runner_name": order.runner_name or "",
+            "side": order.side,
+            "price": f"{float(order.price):.6f}",
+            "stake": f"{float(order.stake):.6f}",
+            "matched": f"{float(order.matched):.6f}",
+            "remaining": f"{float(order.remaining):.6f}",
+            "queue_ahead_initial": f"{float(order.queue_ahead_initial):.6f}",
+            "queue_ahead_remaining": f"{float(order.queue_ahead_remaining):.6f}",
+            "status": order.status.value,
+            "liability": f"{liab:.6f}",
+            "free_balance": f"{float(free_balance):.6f}",
+            "note": note,
+        })
+
 
 def _engine_v2_find_runner(
     *,
