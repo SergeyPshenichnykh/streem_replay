@@ -372,6 +372,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--col-width", type=int, default=46, help="Ladder column width (characters).")
     p.add_argument("--cs-cols", type=int, default=3, help="How many Correct Score ladders per row.")
     p.add_argument(
+        "--cs-dutch-signals",
+        action="store_true",
+        help=(
+            "In Correct Score numeric table, add dutching signal columns for taker/maker "
+            "variants (cover <=1/<=2/<=3 goals and ALL runners)."
+        ),
+    )
+    p.add_argument(
         "--ladder-nonempty-only",
         action="store_true",
         help="In ladder mode, show only price rows with any size (or best back/lay).",
@@ -417,6 +425,52 @@ def parse_args() -> argparse.Namespace:
         "--demo-orders",
         action="store_true",
         help="Populate MYL/MYB/MAT columns with deterministic demo values (UI check).",
+    )
+    p.add_argument(
+        "--seed-under-lay-grid",
+        action="store_true",
+        help="Seed maker-only LAY grid orders for totals Under runner (experimental).",
+    )
+    p.add_argument(
+        "--seed-under-lay-grid-line",
+        type=float,
+        default=5.5,
+        help="Totals line to seed Under LAY grid for (e.g. 5.5).",
+    )
+    p.add_argument(
+        "--seed-under-lay-grid-low",
+        type=float,
+        default=1.01,
+        help="Lowest odds for the Under LAY grid (inclusive).",
+    )
+    p.add_argument(
+        "--seed-under-lay-grid-high",
+        type=float,
+        default=1.20,
+        help="Highest odds for the Under LAY grid (inclusive).",
+    )
+    p.add_argument(
+        "--seed-under-lay-grid-size",
+        type=float,
+        default=10.0,
+        help="Stake size to place at each price in the Under LAY grid.",
+    )
+    p.add_argument(
+        "--seed-under-lay-grid-cap-at-bl",
+        action="store_true",
+        default=True,
+        help="Cap the LAY grid max price at current best_lay (BL) for that runner (default: on).",
+    )
+    p.add_argument(
+        "--no-seed-under-lay-grid-cap-at-bl",
+        action="store_false",
+        dest="seed_under_lay_grid_cap_at_bl",
+        help="Do not cap the LAY grid at best_lay (may place behind BL).",
+    )
+    p.add_argument(
+        "--show-queue",
+        action="store_true",
+        help="In ladder view, show queue before/after for MYL/MYB rows (experimental).",
     )
     p.add_argument(
         "--list-totals",
@@ -647,6 +701,7 @@ def render_runner_ladder(
     max_rows: int = 0,
     my_col_width: int = 0,
     order_model: OrderModel | None = None,
+    show_queue: bool = False,
     price_low: float | None = None,
     price_high: float | None = None,
 ) -> list[str]:
@@ -668,12 +723,17 @@ def render_runner_ladder(
     # MY_LAY (maker) | MKT_BACK | PRICE | MKT_LAY | MY_BACK (maker) | MY_MATCHED
     myw = max(0, int(my_col_width))
     my_hdr = (lambda s: f"{s:>{myw}}") if myw else (lambda _s: "")
-    out.append(
-        f"{my_hdr('MYL')}"
-        + ("│" if myw else "")
-        + f"{'L':>6}│{'P':>4}│{'B':>6}"
-        + ("│" + my_hdr('MYB') + f"│{'VOL':>6}│" + my_hdr('MAT') if myw else "")
-    )
+    if myw:
+        if show_queue:
+            out.append(
+                f"{my_hdr('MYL')}│{'Q0':>6}│{'Q1':>6}│{'L':>6}│{'P':>4}│{'B':>6}│{my_hdr('MYB')}│{'VOL':>6}│{my_hdr('MAT')}"
+            )
+        else:
+            out.append(
+                f"{my_hdr('MYL')}│{'L':>6}│{'P':>4}│{'B':>6}│{my_hdr('MYB')}│{'VOL':>6}│{my_hdr('MAT')}"
+            )
+    else:
+        out.append(f"{'L':>6}│{'P':>4}│{'B':>6}")
 
     for row_i, price in enumerate(window):
         bsz = runner.available_to_back.get(price)
@@ -715,6 +775,8 @@ def render_runner_ladder(
         # Bot columns (maker orders + matched), auto width.
         my_lay_txt = ""
         my_back_txt = ""
+        q0_txt = ""
+        q1_txt = ""
         vol_txt = ""
         my_mat_txt = ""
         if myw:
@@ -740,13 +802,23 @@ def render_runner_ladder(
 
             my_lay_txt = _c(_fmt_sz(my_lay_val, width=myw), "100;97")
             my_back_txt = _c(_fmt_sz(my_back_val, width=myw), "100;97")
+            if show_queue and my_lay_val is not None and my_lay_val > 0:
+                q_before = 0.0 if lsz is None else float(lsz)
+                q_after = q_before + float(my_lay_val)
+                q0_txt = _c(_fmt_sz(q_before, width=6), "90")
+                q1_txt = _c(_fmt_sz(q_after, width=6), "90")
             traded_here = runner.traded.get(price)
             vol_txt = _c(_fmt_sz(None if traded_here is None else float(traded_here), width=6), "90")
             my_mat_txt = _c(_fmt_sz(my_mat_val, width=myw), "100;97")
         if myw:
-            out.append(
-                f"{my_lay_txt}│{col_l_txt:>6}│{p_txt}│{col_b_txt:>6}│{my_back_txt}│{vol_txt:>6}│{my_mat_txt}"
-            )
+            if show_queue:
+                out.append(
+                    f"{my_lay_txt}│{q0_txt:>6}│{q1_txt:>6}│{col_l_txt:>6}│{p_txt}│{col_b_txt:>6}│{my_back_txt}│{vol_txt:>6}│{my_mat_txt}"
+                )
+            else:
+                out.append(
+                    f"{my_lay_txt}│{col_l_txt:>6}│{p_txt}│{col_b_txt:>6}│{my_back_txt}│{vol_txt:>6}│{my_mat_txt}"
+                )
         else:
             out.append(f"{col_l_txt:>6}│{p_txt}│{col_b_txt:>6}")
         if max_rows > 0 and (len(out) - 2) >= max_rows:
@@ -816,7 +888,7 @@ def _fmt_ip(px: float | None) -> str:
     return f"{(100.0/px):>5.1f}"
 
 
-def _render_cs_numeric_table(state: MarketState, *, under_lines: list[float]) -> list[str]:
+def _render_cs_numeric_table(state: MarketState, *, under_lines: list[float], dutch_signals: bool = False) -> list[str]:
     """Render Correct Score as an aligned numeric table (TEST14 top table, without the chart panel)."""
     def min_total_for_runner(name: str) -> int | None:
         s = score_from_runner_name(name)
@@ -838,15 +910,78 @@ def _render_cs_numeric_table(state: MarketState, *, under_lines: list[float]) ->
             (r.name or str(r.selection_id)),
         )
     )
-    # Name | BB px/sz | BL px/sz | min_total | U{line}...
+    def dutch_margin_pct_from_odds(odds: list[float]) -> float | None:
+        odds = [float(x) for x in odds if x and x > 1.0]
+        if len(odds) < 2:
+            return None
+        inv_sum = sum(1.0 / o for o in odds)
+        if inv_sum <= 0:
+            return None
+        return (1.0 / inv_sum - 1.0) * 100.0
+
+    # Name | BB px/sz | BL px/sz | vol | min_total | dutch signals | U{line}...
     name_w = 14
     w_px = 7
     w_sz = 10
     w_vol = 10
     w_total = 5
-    w_flag = 5
+    # Keep YES/NO readable but add a bit of spacing so columns don't stick together.
+    w_flag = 4
+    # Signal column must fit strings like "+500.00%".
+    w_sig = 9
+    # Coverage flags align with YES/NO cells.
+    w_cov = 4
     # Fixed columns always: U0.5..U8.5 (inclusive) regardless of which totals are selected above.
     under_lines_sorted = [float(x) + 0.5 for x in range(0, 9)]
+    # Market-level dutching signals (summary). Taker BACK uses best LAY. Maker BACK uses best BACK.
+    dutch_cols: list[tuple[str, str]] = []
+    if dutch_signals:
+        # Always compute; the caller decides whether to print.
+        def _odds_for_runner(r: RunnerState, mode: str) -> float | None:
+            if mode == "taker":
+                bl = best_level(r.available_to_lay, side="LAY")
+                return None if bl is None else float(bl[0])
+            bb = best_level(r.available_to_back, side="BACK")
+            return None if bb is None else float(bb[0])
+
+        by_tot: list[tuple[int | None, RunnerState]] = []
+        for rr in runners:
+            nm_raw2 = (rr.name or "").strip()
+            by_tot.append((min_total_for_runner(nm_raw2), rr))
+
+        def _subset_odds(max_goals: int | None, mode: str) -> list[float]:
+            odds: list[float] = []
+            for tg, rr in by_tot:
+                if max_goals is not None:
+                    if tg is None or tg > max_goals:
+                        continue
+                px = _odds_for_runner(rr, mode)
+                if px is not None and px > 1.0:
+                    odds.append(px)
+            return odds
+
+        def _fmt_sig(pct: float | None) -> str:
+            if pct is None or pct <= 0:
+                return f"{'-':>{w_sig}}"
+            s = "+" + f"{pct:.2f}%"
+            if len(s) > w_sig:
+                # Keep right side (…%) visible.
+                s = s[-w_sig:]
+            return f"{s:>{w_sig}}"
+
+        for max_goals, label in ((1, "1"), (2, "2"), (3, "3"), (None, "ALL")):
+            t_pct = dutch_margin_pct_from_odds(_subset_odds(max_goals, "taker"))
+            m_pct = dutch_margin_pct_from_odds(_subset_odds(max_goals, "maker"))
+            dutch_cols.append((f"DT{label}", _fmt_sig(t_pct)))
+            dutch_cols.append((f"DM{label}", _fmt_sig(m_pct)))
+
+    # Keep the table compact: show dutching summary as a separate line(s),
+    # not as many empty columns repeated per row.
+    out: list[str] = []
+    if dutch_cols:
+        parts = [f"{h}={v.strip()}" for (h, v) in dutch_cols]
+        out.append("DUTCH: " + "  ".join(parts))
+
     header = (
         f"{'Name':<{name_w}}"
         f"│{'back1_p':>{w_px}}"
@@ -855,9 +990,10 @@ def _render_cs_numeric_table(state: MarketState, *, under_lines: list[float]) ->
         f"│{'lay1_v':>{w_sz}}"
         f"│{'vol':>{w_vol}}"
         f"│{'tot':>{w_total}}"
+        + (f"│{'C1':>{w_cov}}│{'C2':>{w_cov}}│{'C3':>{w_cov}}│{'CA':>{w_cov}}" if dutch_signals else "")
         + "".join([f"│{('U' + str(x).replace('.0','')):>{w_flag}}" for x in under_lines_sorted])
     )
-    out: list[str] = [header, "-" * len(_strip_ansi(header))]
+    out.extend([header, "-" * len(_strip_ansi(header))])
 
     for r in runners:
         nm = (r.name or str(r.selection_id))
@@ -876,12 +1012,31 @@ def _render_cs_numeric_table(state: MarketState, *, under_lines: list[float]) ->
 
         tot_goals: int | None = min_total_for_runner(nm_raw)
 
+        def _fmt_cell(s: str, w: int) -> str:
+            # Compact-but-readable: fixed width with slight padding.
+            if w == 4:
+                if s == "YES":
+                    return "YES "
+                if s == "NO":
+                    return " NO "
+                return "  - "
+            if s == "-":
+                return f"{s:>{w}}"
+            return f"{s:^{w}}"
+
         def yn(line: float) -> str:
             if tot_goals is None:
-                return f"{'-':>{w_flag}}"
+                return _fmt_cell("-", w_flag)
             thr = int(math.floor(float(line)))
             # Under N.5 wins if goals <= N. For Any Other buckets, we use the minimum possible total.
-            return f"{('YES' if tot_goals <= thr else 'NO'):>{w_flag}}"
+            return _fmt_cell(("YES" if tot_goals <= thr else "NO"), w_flag)
+
+        def cov(max_goals: int | None) -> str:
+            if tot_goals is None:
+                return _fmt_cell("-", w_cov)
+            if max_goals is None:
+                return _fmt_cell("YES", w_cov)
+            return _fmt_cell(("YES" if tot_goals <= max_goals else "NO"), w_cov)
 
         out.append(
             f"{nm:<{name_w}}"
@@ -891,6 +1046,7 @@ def _render_cs_numeric_table(state: MarketState, *, under_lines: list[float]) ->
             f"│{fmt_num(bl_sz, width=w_sz, decimals=2)}"
             f"│{fmt_num(vol, width=w_vol, decimals=2)}"
             f"│{(('-' if tot_goals is None else str(tot_goals))):>{w_total}}"
+            + ("".join([f"│{cov(1)}│{cov(2)}│{cov(3)}│{cov(None)}"]) if dutch_signals else "")
             + "".join([f"│{yn(x)}" for x in under_lines_sorted])
         )
 
@@ -1145,6 +1301,7 @@ def _render_dashboard_printing(
     ticks_below: int,
     col_width: int,
     cs_cols: int,
+    cs_dutch_signals: bool = False,
     ladder_nonempty_only: bool,
     ladder_max_rows: int,
     honest_cs: bool,
@@ -1165,6 +1322,8 @@ def _render_dashboard_printing(
     self_check: bool,
     smooth_ui: bool,
     balance: float | None,
+    order_model: OrderModel,
+    show_queue: bool = False,
     paused: bool = False,
     err: str | None = None,
     key: str | None = None,
@@ -1262,7 +1421,6 @@ def _render_dashboard_printing(
         )
         print("\033[4;1H", end="")
 
-    order_model = OrderModel()
     if list_totals:
         # Print all totals (Over/Under Goals) markets at this frame, then exit.
         def fmt_best(r: RunnerState) -> tuple[str, str]:
@@ -1325,6 +1483,7 @@ def render_dashboard(
     ticks_below: int,
     col_width: int,
     cs_cols: int,
+    cs_dutch_signals: bool = False,
     ladder_nonempty_only: bool,
     ladder_max_rows: int,
     honest_cs: bool,
@@ -1345,12 +1504,14 @@ def render_dashboard(
     self_check: bool,
     smooth_ui: bool,
     balance: float | None,
+    order_model: OrderModel | None = None,
+    show_queue: bool = False,
     _internal_no_diff: bool = False,
     paused: bool = False,
     err: str | None = None,
     key: str | None = None,
 ) -> None:
-    order_model = OrderModel()
+    order_model = order_model or OrderModel()
     if smooth_ui and not no_clear and not _internal_no_diff:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -1372,6 +1533,7 @@ def render_dashboard(
                 ticks_below=ticks_below,
                 col_width=col_width,
                 cs_cols=cs_cols,
+                cs_dutch_signals=cs_dutch_signals,
                 ladder_nonempty_only=ladder_nonempty_only,
                 ladder_max_rows=ladder_max_rows,
                 honest_cs=honest_cs,
@@ -1392,6 +1554,8 @@ def render_dashboard(
                 self_check=self_check,
                 smooth_ui=False,
                 balance=balance,
+                order_model=order_model,
+                show_queue=show_queue,
                 _internal_no_diff=True,
                 paused=paused,
                 err=err,
@@ -1419,6 +1583,7 @@ def render_dashboard(
         ticks_below=ticks_below,
         col_width=col_width,
         cs_cols=cs_cols,
+        cs_dutch_signals=cs_dutch_signals,
         ladder_nonempty_only=ladder_nonempty_only,
         ladder_max_rows=ladder_max_rows,
         honest_cs=honest_cs,
@@ -1439,6 +1604,8 @@ def render_dashboard(
         self_check=self_check,
         smooth_ui=smooth_ui,
         balance=balance,
+        order_model=order_model,
+        show_queue=show_queue,
         paused=paused,
         err=err,
         key=key,
@@ -1606,6 +1773,7 @@ def render_dashboard(
                     max_rows=ladder_max_rows,
                     my_col_width=6,
                     order_model=order_model,
+                    show_queue=bool(show_queue),
                     price_low=1.01 if use_fixed_grid else None,
                     price_high=1.40 if use_fixed_grid else None,
                 )
@@ -1648,7 +1816,7 @@ def render_dashboard(
                 if self_check:
                     _self_check_under_monotonicity(st)
                 ou_lines = [float(over_under_line(x)) for x in ou_show if over_under_line(x) is not None]
-                for line in _render_cs_numeric_table(st, under_lines=ou_lines):
+                for line in _render_cs_numeric_table(st, under_lines=ou_lines, dutch_signals=bool(cs_dutch_signals)):
                     print(line)
                 print("-" * 110)
         # In smooth-ui mode, clear any leftover from previous longer frame without flashing.
@@ -1873,6 +2041,7 @@ def render_dashboard(
                     max_rows=ladder_max_rows,
                     my_col_width=myw,
                     order_model=order_model,
+                    show_queue=bool(show_queue),
                 )
                 for runner in runners_sorted
             ]
@@ -1901,6 +2070,7 @@ def render_dashboard(
                         max_rows=ladder_max_rows,
                         my_col_width=myw,
                         order_model=order_model,
+                        show_queue=bool(show_queue),
                     )
                 )
             print_columns(cols, col_width=col_width)
@@ -1929,6 +2099,7 @@ def render_dashboard(
                         max_rows=ladder_max_rows,
                         my_col_width=myw,
                         order_model=order_model,
+                        show_queue=bool(show_queue),
                     )
                 )
                 # Keep the console readable: limit CS to a few columns; remaining go next row.
@@ -1992,6 +2163,8 @@ def stream_replay(args: argparse.Namespace) -> int:
 
     markets: dict[str, MarketState] = {}
     meta_by_market_id: dict[str, MarketMeta] = {}
+    order_model = OrderModel()
+    seeded_under_lay_grid: set[tuple[str, int, float | None]] = set()
     frames = 0
     next_frame_pt: int | None = None
     cadence_ms = max(1, int(args.cadence_ms))
@@ -2171,6 +2344,55 @@ def stream_replay(args: argparse.Namespace) -> int:
                             dedup_market_ids.add(pick_canonical_market_id(mids, meta_by_market_id))
 
                     frames += 1
+
+                    # Experimental: seed a maker-only LAY grid on totals Under runner.
+                    if bool(getattr(args, "seed_under_lay_grid", False)):
+                        want_line = float(getattr(args, "seed_under_lay_grid_line", 5.5))
+                        px_lo = float(getattr(args, "seed_under_lay_grid_low", 1.01))
+                        px_hi = float(getattr(args, "seed_under_lay_grid_high", 1.20))
+                        stake_each = float(getattr(args, "seed_under_lay_grid_size", 10.0))
+                        cap_at_bl = bool(getattr(args, "seed_under_lay_grid_cap_at_bl", True))
+
+                        for mid in sorted(dedup_market_ids):
+                            st = markets.get(mid)
+                            if st is None or not should_render(st, next_frame_pt):
+                                continue
+                            if not is_over_under_goals(st):
+                                continue
+                            line = over_under_line(st)
+                            if line is None or abs(float(line) - want_line) > 1e-9:
+                                continue
+                            # Under runner only.
+                            under: RunnerState | None = None
+                            for r in st.runners.values():
+                                if (r.name or "").lower().startswith("under"):
+                                    under = r
+                                    break
+                            if under is None:
+                                continue
+                            bl = best_level(under.available_to_lay, side="LAY")
+                            bb = best_level(under.available_to_back, side="BACK")
+                            if bl is None or bb is None:
+                                continue
+                            best_lay = float(bl[0])
+                            best_back = float(bb[0])
+                            hi_eff = min(px_hi, best_lay) if cap_at_bl else px_hi
+                            if hi_eff < px_lo:
+                                continue
+
+                            grid_prices = ladder_window_range(px_lo, hi_eff)
+                            for px in grid_prices:
+                                # Maker-only LAY: do not cross best_back.
+                                if float(px) <= best_back + 1e-9:
+                                    continue
+                                k = (mid, int(under.selection_id), under.handicap)
+                                seeded_under_lay_grid.add(k)
+                                order_model.by_key[(mid, int(under.selection_id), under.handicap, float(px))] = MyOrdersAtPrice(
+                                    my_lay=max(0.0, stake_each),
+                                    my_back=0.0,
+                                    matched=0.0,
+                                )
+
                     if args.emit_json:
                         payload = build_emit_json_frame(
                             pt=next_frame_pt,
@@ -2186,11 +2408,11 @@ def stream_replay(args: argparse.Namespace) -> int:
                         )
                         print(json.dumps(payload, ensure_ascii=False))
                     else:
-                        render_dashboard(
-                            pt=next_frame_pt,
-                            markets=markets,
-                            selected_ids=selected_ids,
-                            market_ids=dedup_market_ids,
+	                        render_dashboard(
+	                            pt=next_frame_pt,
+	                            markets=markets,
+	                            selected_ids=selected_ids,
+	                            market_ids=dedup_market_ids,
                             top_n=args.top,
                             depth=args.depth,
                             no_clear=args.no_clear,
@@ -2202,9 +2424,10 @@ def stream_replay(args: argparse.Namespace) -> int:
                             center_mode=args.center,
                             ticks_above=args.ticks_above,
                             ticks_below=args.ticks_below,
-                            col_width=args.col_width,
-                            cs_cols=args.cs_cols,
-                            ladder_nonempty_only=bool(args.ladder_nonempty_only),
+	                            col_width=args.col_width,
+	                            cs_cols=args.cs_cols,
+	                            cs_dutch_signals=bool(getattr(args, "cs_dutch_signals", False)),
+	                            ladder_nonempty_only=bool(args.ladder_nonempty_only),
                             ladder_max_rows=int(args.ladder_max_rows or 0),
                             honest_cs=bool(args.honest_cs),
                             dutching_debug=bool(args.dutching_debug),
@@ -2224,6 +2447,8 @@ def stream_replay(args: argparse.Namespace) -> int:
                             self_check=bool(args.self_check),
                             smooth_ui=bool(args.smooth_ui),
                             balance=balance,
+                            order_model=order_model,
+                            show_queue=bool(getattr(args, "show_queue", False)),
                             paused=paused,
                             err=interactive_err,
                             key=last_key,
@@ -2297,6 +2522,7 @@ def stream_replay(args: argparse.Namespace) -> int:
                                     ticks_below=args.ticks_below,
                                     col_width=args.col_width,
                                     cs_cols=args.cs_cols,
+                                    cs_dutch_signals=bool(getattr(args, "cs_dutch_signals", False)),
                                     ladder_nonempty_only=bool(args.ladder_nonempty_only),
                                     ladder_max_rows=int(args.ladder_max_rows or 0),
                                     honest_cs=bool(args.honest_cs),
@@ -2317,6 +2543,8 @@ def stream_replay(args: argparse.Namespace) -> int:
                                     self_check=bool(args.self_check),
                                     smooth_ui=bool(args.smooth_ui),
                                     balance=balance,
+                                    order_model=order_model,
+                                    show_queue=bool(getattr(args, "show_queue", False)),
                                     paused=True,
                                     err=interactive_err,
                                     key=last_key,
