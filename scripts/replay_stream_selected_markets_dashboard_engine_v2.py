@@ -597,6 +597,23 @@ def parse_args() -> argparse.Namespace:
         default="replay/delta_10s_macro_min10/engine_v3_execution_log.csv",
         help="CSV log for ENGINE V3 simulated execution events.",
     )
+    p.add_argument(
+        "--engine-v3-action-log",
+        default="replay/delta_10s/action_log.csv",
+        help="Action log used by ENGINE V3 queue-aware fill simulation.",
+    )
+    p.add_argument(
+        "--engine-v3-fill-source",
+        choices=("match_only", "match_plus_visible_remove"),
+        default="match_only",
+        help="Action-log consumption source used by ENGINE V3 fills.",
+    )
+    p.add_argument(
+        "--engine-v3-place-delay-sec",
+        type=float,
+        default=5.0,
+        help="Placement delay for ENGINE V3 orders, in seconds.",
+    )
     return p.parse_args()
 
 
@@ -2313,6 +2330,23 @@ def _engine_v3_get_queue_ahead(runner: RunnerState, side: str, price: float) -> 
     return 0.0
 
 
+def _engine_v3_is_inplay_phase(row: dict[str, object]) -> bool:
+    phase = str(row.get("phase") or "").strip().upper()
+    if not phase:
+        return False
+    if "PRE" in phase or "BEFORE" in phase or "KICKOFF" in phase:
+        return False
+    return (
+        "IN_PLAY" in phase
+        or "INPLAY" in phase
+        or phase.startswith("NORMAL_")
+        or "FIRST_HALF" in phase
+        or "SECOND_HALF" in phase
+        or "HALF_TIME" in phase
+        or "EXTRA_TIME" in phase
+    )
+
+
 def _engine_v3_make_order_from_row(
     row: dict[str, object],
     st: MarketState,
@@ -2350,12 +2384,13 @@ def _engine_v3_make_order_from_row(
         side=side,
         price=price,
         stake=stake,
+        book_side=str(row.get("side") or ""),
         remaining=stake,
         matched=0.0,
         avg_price=0.0,
         queue_ahead_initial=0.0,
         queue_ahead_remaining=0.0,
-        status=OrderStatus.OPEN,
+        status=OrderStatus.REQUESTED_PLACE,
         placed_pt=int(pt),
         placed_utc=str(utc or ""),
         fill_source="",
@@ -2370,6 +2405,11 @@ def _engine_v3_log_event(
     signal_id: str = "",
     liability: float | None = None,
     free_balance: float = 0.0,
+    queue_delta: float = 0.0,
+    matched_now: float = 0.0,
+    action_source: str = "",
+    action_count: int = 0,
+    action_amount: float = 0.0,
     note: str = "",
 ) -> None:
     import csv
@@ -2422,6 +2462,11 @@ def _engine_v3_log_event(
         "status",
         "liability",
         "free_balance",
+        "queue_delta",
+        "matched_now",
+        "action_source",
+        "action_count",
+        "action_amount",
         "note",
     ]
 
@@ -2451,8 +2496,50 @@ def _engine_v3_log_event(
             "status": order.status.value,
             "liability": f"{liab:.6f}",
             "free_balance": f"{float(free_balance):.6f}",
+            "queue_delta": f"{float(queue_delta):.6f}",
+            "matched_now": f"{float(matched_now):.6f}",
+            "action_source": action_source,
+            "action_count": int(action_count),
+            "action_amount": f"{float(action_amount):.6f}",
             "note": note,
         })
+
+
+def _engine_v3_load_action_log(path: str) -> list[dict[str, object]]:
+    import csv
+    from pathlib import Path
+
+    p = Path(path)
+    if not p.exists():
+        return []
+
+    events: list[dict[str, object]] = []
+    with p.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            action = str(row.get("action") or "")
+            if action not in {"MATCH", "VISIBLE_REMOVE"}:
+                continue
+            try:
+                event_pt = _engine_v2_ts_ms(str(row.get("utc") or ""))
+                price = float(row.get("price") or 0.0)
+                amount = float(row.get("amount") or 0.0)
+            except Exception:
+                continue
+            if event_pt <= 0 or price <= 1.0 or amount <= 0.0:
+                continue
+            events.append({
+                "pt": event_pt,
+                "utc": row.get("utc", ""),
+                "action": action,
+                "market_type": row.get("market_type", ""),
+                "market_name": row.get("market_name", ""),
+                "runner_name": row.get("runner_name", ""),
+                "side": row.get("side", ""),
+                "price": price,
+                "amount": amount,
+            })
+    events.sort(key=lambda x: int(x.get("pt") or 0))
+    return events
 
 
 def _engine_v3_place_orders_only(
@@ -2463,24 +2550,65 @@ def _engine_v3_place_orders_only(
     rows: list[dict[str, object]],
     runtime_orders: dict[str, V3Order],
     balance: float | None,
+    place_delay_sec: float,
 ) -> None:
     for row in rows:
         entry_ms = int(row.get("_entry_ms") or 0)
         if entry_ms <= 0 or pt < entry_ms:
             continue
+        phase = str(row.get("phase") or "")
+        inplay = _engine_v3_is_inplay_phase(row)
+        effective_delay_sec = max(0.0, float(place_delay_sec)) if inplay else 0.0
+        effective_delay_ms = int(effective_delay_sec * 1000.0)
 
-        st, runner = _engine_v2_find_runner(markets=markets, row=row)
+        order: V3Order | None = None
+        st: MarketState | None = None
+        runner: RunnerState | None = None
+        runtime_order_id = str(row.get("_engine_v3_order_id") or "")
+
+        if runtime_order_id:
+            order = runtime_orders.get(runtime_order_id)
+
+        if order is None:
+            st, runner = _engine_v2_find_runner(markets=markets, row=row)
+            if st is None or runner is None:
+                continue
+
+            order = _engine_v3_make_order_from_row(row, st, runner, entry_ms, str(row.get("first_add_utc") or ""))
+            row["_engine_v3_order_id"] = order.order_id
+            if order.order_id in runtime_orders:
+                order = runtime_orders[order.order_id]
+            else:
+                runtime_orders[order.order_id] = order
+                bal = 0.0 if balance is None else float(balance)
+                _engine_v3_log_event(
+                    event="REQUEST_PLACE",
+                    pt=pt,
+                    order=order,
+                    signal_id=str(row.get("signal_id") or ""),
+                    liability=0.0,
+                    free_balance=bal,
+                    note=f"requested_place phase={phase} inplay={inplay} place_delay_sec={effective_delay_sec:g}",
+                )
+
+        if order.status != OrderStatus.REQUESTED_PLACE:
+            continue
+        if pt < entry_ms + effective_delay_ms:
+            continue
+
         if st is None or runner is None:
-            continue
-
-        order = _engine_v3_make_order_from_row(row, st, runner, pt, utc)
-        if order.order_id in runtime_orders:
-            continue
+            st, runner = _engine_v2_find_runner(markets=markets, row=row)
+            if st is None or runner is None:
+                continue
 
         queue_ahead = _engine_v3_get_queue_ahead(runner, order.side, order.price)
         order.queue_ahead_initial = queue_ahead
         order.queue_ahead_remaining = queue_ahead
-        runtime_orders[order.order_id] = order
+        order.current_queue_size = queue_ahead
+        order.previous_queue_size = queue_ahead
+        order.status = OrderStatus.OPEN
+        order.placed_pt = int(pt)
+        order.placed_utc = str(utc or "")
 
         locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
         bal = 0.0 if balance is None else float(balance)
@@ -2491,7 +2619,137 @@ def _engine_v3_place_orders_only(
             signal_id=str(row.get("signal_id") or ""),
             liability=_engine_v3_order_liability(order),
             free_balance=bal - locked,
-            note="placed",
+            note=f"placed_after_delay phase={phase} inplay={inplay} place_delay_sec={effective_delay_sec:g}",
+        )
+
+
+def _engine_v3_find_order_runner(
+    *,
+    markets: dict[str, MarketState],
+    order: V3Order,
+) -> RunnerState | None:
+    st = markets.get(order.market_id)
+    if st is None:
+        return None
+
+    runner = st.runners.get(int(order.selection_id))
+    if runner is None or runner.handicap != order.handicap:
+        return None
+    return runner
+
+
+def _engine_v3_update_queue_fills(
+    *,
+    pt: int,
+    markets: dict[str, MarketState],
+    runtime_orders: dict[str, V3Order],
+    balance: float | None,
+) -> None:
+    for order in runtime_orders.values():
+        if not order.is_active():
+            continue
+        if order.placed_pt == pt:
+            continue
+
+        runner = _engine_v3_find_order_runner(markets=markets, order=order)
+        if runner is None:
+            continue
+
+        current_queue = _engine_v3_get_queue_ahead(runner, order.side, order.price)
+        previous_queue = order.previous_queue_size
+        order.current_queue_size = current_queue
+        if previous_queue is None or current_queue >= previous_queue:
+            order.previous_queue_size = current_queue
+            continue
+
+        queue_delta = previous_queue - current_queue
+        matched_now = order.apply_queue_delta(queue_delta)
+        order.previous_queue_size = current_queue
+        if matched_now <= 0:
+            continue
+
+        locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
+        bal = 0.0 if balance is None else float(balance)
+        event = "FILL" if order.status == OrderStatus.FILLED else "PARTIAL_FILL"
+        _engine_v3_log_event(
+            event=event,
+            pt=pt,
+            order=order,
+            liability=_engine_v3_order_liability(order),
+            free_balance=bal - locked,
+            queue_delta=queue_delta,
+            matched_now=matched_now,
+            note="queue_delta",
+        )
+
+
+def _engine_v3_action_matches_order(event: dict[str, object], order: V3Order) -> bool:
+    return (
+        str(event.get("market_type") or "") == str(order.market_type or "")
+        and str(event.get("market_name") or "") == str(order.market_name or "")
+        and str(event.get("runner_name") or "") == str(order.runner_name or "")
+        and str(event.get("side") or "") == str(order.book_side or "")
+        and abs(float(event.get("price") or 0.0) - float(order.price)) < 1e-9
+    )
+
+
+def _engine_v3_update_action_log_fills(
+    *,
+    pt: int,
+    events: list[dict[str, object]],
+    runtime_orders: dict[str, V3Order],
+    balance: float | None,
+    fill_source: str,
+) -> None:
+    if not events:
+        return
+
+    allowed_actions = {"MATCH"}
+    if fill_source == "match_plus_visible_remove":
+        allowed_actions.add("VISIBLE_REMOVE")
+
+    for order in runtime_orders.values():
+        if not order.is_active():
+            continue
+
+        queue_delta = 0.0
+        action_counts: dict[str, int] = {}
+        action_amounts: dict[str, float] = {}
+        for event in events:
+            if int(event.get("pt") or 0) <= int(order.placed_pt):
+                continue
+            action = str(event.get("action") or "")
+            if action not in allowed_actions:
+                continue
+            if _engine_v3_action_matches_order(event, order):
+                amount = float(event.get("amount") or 0.0)
+                queue_delta += amount
+                action_counts[action] = action_counts.get(action, 0) + 1
+                action_amounts[action] = action_amounts.get(action, 0.0) + amount
+
+        if queue_delta <= 0.0:
+            continue
+
+        matched_now = order.apply_queue_delta(queue_delta)
+        if matched_now <= 0.0:
+            continue
+
+        locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
+        bal = 0.0 if balance is None else float(balance)
+        event_name = "FILL" if order.status == OrderStatus.FILLED else "PARTIAL_FILL"
+        action_source = "+".join(sorted(action_counts))
+        _engine_v3_log_event(
+            event=event_name,
+            pt=pt,
+            order=order,
+            liability=_engine_v3_order_liability(order),
+            free_balance=bal - locked,
+            queue_delta=queue_delta,
+            matched_now=matched_now,
+            action_source=action_source,
+            action_count=sum(action_counts.values()),
+            action_amount=sum(action_amounts.values()),
+            note="action_log_consumption",
         )
 
 
@@ -3079,6 +3337,10 @@ def stream_replay(args: argparse.Namespace) -> int:
     engine_v2_orders = []
     if bool(getattr(args, "engine_v2_overlay", False)) or bool(getattr(args, "engine_v3_overlay", False)):
         engine_v2_orders = _engine_v2_load_orders(str(getattr(args, "engine_v2_orders", "")))
+    engine_v3_action_events = []
+    if bool(getattr(args, "engine_v3_overlay", False)):
+        engine_v3_action_events = _engine_v3_load_action_log(str(getattr(args, "engine_v3_action_log", "")))
+    engine_v3_action_index = 0
 
     globals()["ENGINE_V2_RUNTIME_ORDERS"] = engine_v2_orders
     globals()["ENGINE_V2_SHOW_MARKETS"] = bool(getattr(args, "engine_v2_show_markets", False))
@@ -3091,6 +3353,7 @@ def stream_replay(args: argparse.Namespace) -> int:
     seeded_under_lay_grid: set[tuple[str, int, float | None, float]] = set()
     frames = 0
     next_frame_pt: int | None = None
+    previous_frame_pt: int | None = None
     cadence_ms = max(1, int(args.cadence_ms))
     earliest_start_pt: int | None = None
 
@@ -3359,6 +3622,17 @@ def stream_replay(args: argparse.Namespace) -> int:
                         )
 
                     if bool(getattr(args, "engine_v3_overlay", False)):
+                        frame_action_events: list[dict[str, object]] = []
+                        while (
+                            engine_v3_action_index < len(engine_v3_action_events)
+                            and int(engine_v3_action_events[engine_v3_action_index].get("pt") or 0) <= int(next_frame_pt)
+                        ):
+                            event = engine_v3_action_events[engine_v3_action_index]
+                            event_pt = int(event.get("pt") or 0)
+                            if previous_frame_pt is None or previous_frame_pt < event_pt:
+                                frame_action_events.append(event)
+                            engine_v3_action_index += 1
+
                         _engine_v3_place_orders_only(
                             pt=int(next_frame_pt),
                             utc=format_pt(next_frame_pt),
@@ -3366,6 +3640,14 @@ def stream_replay(args: argparse.Namespace) -> int:
                             rows=engine_v2_orders,
                             runtime_orders=globals()["ENGINE_V3_RUNTIME_ORDERS"],
                             balance=balance,
+                            place_delay_sec=float(getattr(args, "engine_v3_place_delay_sec", 5.0)),
+                        )
+                        _engine_v3_update_action_log_fills(
+                            pt=int(next_frame_pt),
+                            events=frame_action_events,
+                            runtime_orders=globals()["ENGINE_V3_RUNTIME_ORDERS"],
+                            balance=balance,
+                            fill_source=str(getattr(args, "engine_v3_fill_source", "match_only")),
                         )
 
                     update_order_model_from_current_ladder(
@@ -3642,6 +3924,7 @@ def stream_replay(args: argparse.Namespace) -> int:
                     if args.delay and args.delay > 0:
                         time.sleep(args.delay or DEFAULT_DELAY_SECONDS)
 
+                    previous_frame_pt = int(next_frame_pt)
                     next_frame_pt += cadence_ms
 
         return 0

@@ -5,6 +5,8 @@ from enum import Enum
 
 
 class OrderStatus(str, Enum):
+    REQUESTED_PLACE = "requested_place"
+    REQUESTED_CANCEL = "requested_cancel"
     OPEN = "open"
     PARTIALLY_FILLED = "partially_filled"
     FILLED = "filled"
@@ -26,10 +28,13 @@ class V3Order:
     price: float
     stake: float
     remaining: float
+    book_side: str = ""
     matched: float = 0.0
     avg_price: float = 0.0
     queue_ahead_initial: float = 0.0
     queue_ahead_remaining: float = 0.0
+    previous_queue_size: float | None = None
+    current_queue_size: float | None = None
     status: OrderStatus = OrderStatus.OPEN
     placed_pt: int = 0
     placed_utc: str = ""
