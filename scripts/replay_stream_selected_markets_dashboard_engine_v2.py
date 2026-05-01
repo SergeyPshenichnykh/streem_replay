@@ -29,6 +29,7 @@ if str(_ROOT) not in sys.path:
 from bot.dutching import calc_dutching  # noqa: E402
 from bot.order_model import OrderModel  # noqa: E402
 from bot.order_model import MyOrdersAtPrice  # noqa: E402
+from bot.order_model import OrderStatus  # noqa: E402
 from bot.order_model import V3Order  # noqa: E402
 
 from replay_stream_match_odds_correct import (
@@ -556,6 +557,11 @@ def parse_args() -> argparse.Namespace:
         help="Show ENGINE V2 detector / shadow order overlay.",
     )
     p.add_argument(
+        "--engine-v3-overlay",
+        action="store_true",
+        help="Enable ENGINE V3 shadow execution logging (PLACE-only for now).",
+    )
+    p.add_argument(
         "--engine-v2-signals",
         default="replay/delta_10s_macro_min10/profile_engine_detected_fast.csv",
         help="CSV with detected engine signals.",
@@ -585,6 +591,11 @@ def parse_args() -> argparse.Namespace:
         "--engine-v2-exec-log",
         default="replay/delta_10s_macro_min10/engine_v2_execution_log.csv",
         help="CSV log for ENGINE V2 simulated execution events.",
+    )
+    p.add_argument(
+        "--engine-v3-exec-log",
+        default="replay/delta_10s_macro_min10/engine_v3_execution_log.csv",
+        help="CSV log for ENGINE V3 simulated execution events.",
     )
     return p.parse_args()
 
@@ -2293,6 +2304,64 @@ def _engine_v3_order_liability(order: V3Order) -> float:
     return order.exposure()
 
 
+def _engine_v3_get_queue_ahead(runner: RunnerState, side: str, price: float) -> float:
+    px = float(price)
+    if side == "LAY":
+        return float(runner.available_to_back.get(px) or 0.0)
+    if side == "BACK":
+        return float(runner.available_to_lay.get(px) or 0.0)
+    return 0.0
+
+
+def _engine_v3_make_order_from_row(
+    row: dict[str, object],
+    st: MarketState,
+    runner: RunnerState,
+    pt: int,
+    utc: str,
+) -> V3Order:
+    side = str(row.get("entry_order_side") or "")
+    price = float(row.get("_price") or row.get("price") or 0.0)
+    stake = float(row.get("_stake") or row.get("stake") or 0.0)
+    signal_id = str(row.get("signal_id") or "")
+    order_id = str(
+        row.get("order_id")
+        or "|".join(
+            [
+                signal_id,
+                st.market_id,
+                str(runner.selection_id),
+                str(runner.handicap),
+                side,
+                f"{price:g}",
+                str(row.get("first_add_utc") or utc or pt),
+            ]
+        )
+    )
+
+    return V3Order(
+        order_id=order_id,
+        market_id=st.market_id,
+        selection_id=int(runner.selection_id),
+        handicap=runner.handicap,
+        market_type=st.market_type or str(row.get("market_type") or "") or None,
+        market_name=st.market_name or str(row.get("market_name") or "") or None,
+        runner_name=runner.name or str(row.get("runner_name") or "") or None,
+        side=side,
+        price=price,
+        stake=stake,
+        remaining=stake,
+        matched=0.0,
+        avg_price=0.0,
+        queue_ahead_initial=0.0,
+        queue_ahead_remaining=0.0,
+        status=OrderStatus.OPEN,
+        placed_pt=int(pt),
+        placed_utc=str(utc or ""),
+        fill_source="",
+    )
+
+
 def _engine_v3_log_event(
     *,
     event: str,
@@ -2384,6 +2453,46 @@ def _engine_v3_log_event(
             "free_balance": f"{float(free_balance):.6f}",
             "note": note,
         })
+
+
+def _engine_v3_place_orders_only(
+    *,
+    pt: int,
+    utc: str,
+    markets: dict[str, MarketState],
+    rows: list[dict[str, object]],
+    runtime_orders: dict[str, V3Order],
+    balance: float | None,
+) -> None:
+    for row in rows:
+        entry_ms = int(row.get("_entry_ms") or 0)
+        if entry_ms <= 0 or pt < entry_ms:
+            continue
+
+        st, runner = _engine_v2_find_runner(markets=markets, row=row)
+        if st is None or runner is None:
+            continue
+
+        order = _engine_v3_make_order_from_row(row, st, runner, pt, utc)
+        if order.order_id in runtime_orders:
+            continue
+
+        queue_ahead = _engine_v3_get_queue_ahead(runner, order.side, order.price)
+        order.queue_ahead_initial = queue_ahead
+        order.queue_ahead_remaining = queue_ahead
+        runtime_orders[order.order_id] = order
+
+        locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
+        bal = 0.0 if balance is None else float(balance)
+        _engine_v3_log_event(
+            event="PLACE",
+            pt=pt,
+            order=order,
+            signal_id=str(row.get("signal_id") or ""),
+            liability=_engine_v3_order_liability(order),
+            free_balance=bal - locked,
+            note="placed",
+        )
 
 
 def _engine_v2_find_runner(
@@ -2763,6 +2872,9 @@ ENGINE_V2_SHOW_MARKETS = False
 ENGINE_V2_MAX_LADDERS = 3
 ENGINE_V2_EXEC_LOG_PATH = ""
 ENGINE_V2_LOGGED_EVENTS = set()
+ENGINE_V3_RUNTIME_ORDERS = {}
+ENGINE_V3_EXEC_LOG_PATH = ""
+ENGINE_V3_LOGGED_EVENTS = set()
 
 def _engine_v2_ts_ms(s: str) -> int:
     from datetime import datetime
@@ -2965,7 +3077,7 @@ def stream_replay(args: argparse.Namespace) -> int:
     order_model = OrderModel()
 
     engine_v2_orders = []
-    if bool(getattr(args, "engine_v2_overlay", False)):
+    if bool(getattr(args, "engine_v2_overlay", False)) or bool(getattr(args, "engine_v3_overlay", False)):
         engine_v2_orders = _engine_v2_load_orders(str(getattr(args, "engine_v2_orders", "")))
 
     globals()["ENGINE_V2_RUNTIME_ORDERS"] = engine_v2_orders
@@ -2973,6 +3085,8 @@ def stream_replay(args: argparse.Namespace) -> int:
     globals()["ENGINE_V2_MAX_LADDERS"] = max(1, int(getattr(args, "engine_v2_max_ladders", 3)))
     globals()["ENGINE_V2_EXEC_LOG_PATH"] = str(getattr(args, "engine_v2_exec_log", ""))
     globals()["ENGINE_V2_MAX_LADDERS"] = max(1, int(getattr(args, "engine_v2_max_ladders", 3)))
+    globals()["ENGINE_V3_RUNTIME_ORDERS"] = {}
+    globals()["ENGINE_V3_EXEC_LOG_PATH"] = str(getattr(args, "engine_v3_exec_log", ""))
 
     seeded_under_lay_grid: set[tuple[str, int, float | None, float]] = set()
     frames = 0
@@ -3241,6 +3355,16 @@ def stream_replay(args: argparse.Namespace) -> int:
                             markets=markets,
                             order_model=order_model,
                             orders=engine_v2_orders,
+                            balance=balance,
+                        )
+
+                    if bool(getattr(args, "engine_v3_overlay", False)):
+                        _engine_v3_place_orders_only(
+                            pt=int(next_frame_pt),
+                            utc=format_pt(next_frame_pt),
+                            markets=markets,
+                            rows=engine_v2_orders,
+                            runtime_orders=globals()["ENGINE_V3_RUNTIME_ORDERS"],
                             balance=balance,
                         )
 
