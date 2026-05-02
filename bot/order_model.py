@@ -39,6 +39,9 @@ class V3Order:
     cancel_requested_pt: int = 0
     cancel_effective_pt: int = 0
     inplay: bool = False
+    exited_pt: int = 0
+    settled_pt: int = 0
+    pnl_v3: float = 0.0
     status: OrderStatus = OrderStatus.OPEN
     placed_pt: int = 0
     placed_utc: str = ""

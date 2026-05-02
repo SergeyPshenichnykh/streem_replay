@@ -2422,6 +2422,11 @@ def _engine_v3_log_event(
     action_source: str = "",
     action_count: int = 0,
     action_amount: float = 0.0,
+    pnl_v3: float = 0.0,
+    matched_fraction: float = 0.0,
+    exit_utc: str = "",
+    exit_price: str = "",
+    settlement: str = "",
     note: str = "",
 ) -> None:
     import csv
@@ -2479,6 +2484,11 @@ def _engine_v3_log_event(
         "action_source",
         "action_count",
         "action_amount",
+        "pnl_v3",
+        "matched_fraction",
+        "exit_utc",
+        "exit_price",
+        "settlement",
         "note",
     ]
 
@@ -2513,6 +2523,11 @@ def _engine_v3_log_event(
             "action_source": action_source,
             "action_count": int(action_count),
             "action_amount": f"{float(action_amount):.6f}",
+            "pnl_v3": f"{float(pnl_v3):.6f}",
+            "matched_fraction": f"{float(matched_fraction):.6f}",
+            "exit_utc": exit_utc,
+            "exit_price": exit_price,
+            "settlement": settlement,
             "note": note,
         })
 
@@ -2839,6 +2854,73 @@ def _engine_v3_update_cancel_horizon(
                 f"cancel_delay_sec={(cancel_delay_ms if bool(order.inplay) else 0) / 1000.0:g} "
                 f"inplay={bool(order.inplay)}"
             ),
+        )
+
+
+def _engine_v3_update_exit_settle(
+    *,
+    pt: int,
+    rows: list[dict[str, object]],
+    runtime_orders: dict[str, V3Order],
+    balance: float | None,
+) -> None:
+    for row in rows:
+        order_id = str(row.get("_engine_v3_order_id") or "")
+        if not order_id:
+            continue
+
+        order = runtime_orders.get(order_id)
+        if order is None:
+            continue
+        if order.status == OrderStatus.SETTLED:
+            continue
+        if order.matched <= 0.0 or order.stake <= 0.0:
+            continue
+
+        exit_ms = int(row.get("_exit_ms") or 0)
+        if exit_ms <= 0 or pt < exit_ms:
+            continue
+
+        matched_fraction = min(1.0, max(0.0, float(order.matched) / float(order.stake)))
+        pnl_v3 = float(row.get("_pnl") or row.get("pnl_proxy") or 0.0) * matched_fraction
+        exit_utc = str(row.get("exit_utc") or "")
+        exit_price = str(row.get("exit_price") or row.get("price") or "")
+        locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
+        bal = 0.0 if balance is None else float(balance)
+
+        order.status = OrderStatus.EXITED
+        order.exited_pt = int(pt)
+        order.pnl_v3 = pnl_v3
+        _engine_v3_log_event(
+            event="EXIT",
+            pt=pt,
+            order=order,
+            signal_id=str(row.get("signal_id") or ""),
+            liability=_engine_v3_order_liability(order),
+            free_balance=bal - locked,
+            pnl_v3=pnl_v3,
+            matched_fraction=matched_fraction,
+            exit_utc=exit_utc,
+            exit_price=exit_price,
+            settlement="proxy_proportional",
+            note="exit_matched_part",
+        )
+
+        order.status = OrderStatus.SETTLED
+        order.settled_pt = int(pt)
+        _engine_v3_log_event(
+            event="SETTLE",
+            pt=pt,
+            order=order,
+            signal_id=str(row.get("signal_id") or ""),
+            liability=0.0,
+            free_balance=bal + pnl_v3 - locked,
+            pnl_v3=pnl_v3,
+            matched_fraction=matched_fraction,
+            exit_utc=exit_utc,
+            exit_price=exit_price,
+            settlement="proxy_proportional",
+            note="settlement=proxy_proportional",
         )
 
 
@@ -3744,6 +3826,12 @@ def stream_replay(args: argparse.Namespace) -> int:
                             balance=balance,
                             fill_horizon_sec=float(getattr(args, "engine_v3_fill_horizon_sec", 30.0)),
                             cancel_delay_sec=float(getattr(args, "engine_v3_cancel_delay_sec", 5.0)),
+                        )
+                        _engine_v3_update_exit_settle(
+                            pt=int(next_frame_pt),
+                            rows=engine_v2_orders,
+                            runtime_orders=globals()["ENGINE_V3_RUNTIME_ORDERS"],
+                            balance=balance,
                         )
 
                     update_order_model_from_current_ladder(
