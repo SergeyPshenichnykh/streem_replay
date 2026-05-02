@@ -2695,6 +2695,8 @@ def _engine_v3_update_queue_fills(
         order.previous_queue_size = current_queue
         if matched_now <= 0:
             continue
+        if order.first_fill_pt <= 0:
+            order.first_fill_pt = int(pt)
 
         locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
         bal = 0.0 if balance is None else float(balance)
@@ -2761,6 +2763,8 @@ def _engine_v3_update_action_log_fills(
         matched_now = order.apply_queue_delta(queue_delta)
         if matched_now <= 0.0:
             continue
+        if order.first_fill_pt <= 0:
+            order.first_fill_pt = int(pt)
 
         locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
         bal = 0.0 if balance is None else float(balance)
@@ -2879,6 +2883,26 @@ def _engine_v3_update_exit_settle(
 
         exit_ms = int(row.get("_exit_ms") or 0)
         if exit_ms <= 0 or pt < exit_ms:
+            continue
+        if order.first_fill_pt > 0 and exit_ms < int(order.first_fill_pt):
+            if order.late_fill_no_valid_exit_pt <= 0:
+                order.late_fill_no_valid_exit_pt = int(pt)
+                locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
+                bal = 0.0 if balance is None else float(balance)
+                _engine_v3_log_event(
+                    event="LATE_FILL_NO_VALID_EXIT",
+                    pt=pt,
+                    order=order,
+                    signal_id=str(row.get("signal_id") or ""),
+                    liability=_engine_v3_order_liability(order),
+                    free_balance=bal - locked,
+                    pnl_v3=0.0,
+                    matched_fraction=min(1.0, max(0.0, float(order.matched) / float(order.stake))),
+                    exit_utc=str(row.get("exit_utc") or ""),
+                    exit_price=str(row.get("exit_price") or row.get("price") or ""),
+                    settlement="",
+                    note="exit_before_actual_fill",
+                )
             continue
 
         matched_fraction = min(1.0, max(0.0, float(order.matched) / float(order.stake)))
