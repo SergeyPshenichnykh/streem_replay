@@ -39,6 +39,8 @@ class V3Order:
     cancel_requested_pt: int = 0
     cancel_effective_pt: int = 0
     inplay: bool = False
+    first_fill_pt: int = 0
+    late_fill_no_valid_exit_pt: int = 0
     exited_pt: int = 0
     settled_pt: int = 0
     pnl_v3: float = 0.0
