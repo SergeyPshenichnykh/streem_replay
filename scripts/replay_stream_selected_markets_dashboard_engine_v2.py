@@ -29,8 +29,6 @@ if str(_ROOT) not in sys.path:
 from bot.dutching import calc_dutching  # noqa: E402
 from bot.order_model import OrderModel  # noqa: E402
 from bot.order_model import MyOrdersAtPrice  # noqa: E402
-from bot.order_model import OrderStatus  # noqa: E402
-from bot.order_model import V3Order  # noqa: E402
 
 from replay_stream_match_odds_correct import (
     DEFAULT_REPLAY_FILE,
@@ -557,11 +555,6 @@ def parse_args() -> argparse.Namespace:
         help="Show ENGINE V2 detector / shadow order overlay.",
     )
     p.add_argument(
-        "--engine-v3-overlay",
-        action="store_true",
-        help="Enable ENGINE V3 shadow execution logging (PLACE-only for now).",
-    )
-    p.add_argument(
         "--engine-v2-signals",
         default="replay/delta_10s_macro_min10/profile_engine_detected_fast.csv",
         help="CSV with detected engine signals.",
@@ -575,56 +568,6 @@ def parse_args() -> argparse.Namespace:
         "--engine-v2-orders",
         default="replay/delta_10s_macro_min10/filtered_shadow_bot_v2_no_asian.csv",
         help="CSV with V2 shadow orders.",
-    )
-    p.add_argument(
-        "--engine-v2-show-markets",
-        action="store_true",
-        help="Show extra ladder columns for markets used by ENGINE V2 orders.",
-    )
-    p.add_argument(
-        "--engine-v2-max-ladders",
-        type=int,
-        default=3,
-        help="Maximum ENGINE V2 ladder columns shown on pause.",
-    )
-    p.add_argument(
-        "--engine-v2-exec-log",
-        default="replay/delta_10s_macro_min10/engine_v2_execution_log.csv",
-        help="CSV log for ENGINE V2 simulated execution events.",
-    )
-    p.add_argument(
-        "--engine-v3-exec-log",
-        default="replay/delta_10s_macro_min10/engine_v3_execution_log.csv",
-        help="CSV log for ENGINE V3 simulated execution events.",
-    )
-    p.add_argument(
-        "--engine-v3-action-log",
-        default="replay/delta_10s/action_log.csv",
-        help="Action log used by ENGINE V3 queue-aware fill simulation.",
-    )
-    p.add_argument(
-        "--engine-v3-fill-source",
-        choices=("match_only", "match_plus_visible_remove"),
-        default="match_only",
-        help="Action-log consumption source used by ENGINE V3 fills.",
-    )
-    p.add_argument(
-        "--engine-v3-place-delay-sec",
-        type=float,
-        default=5.0,
-        help="Placement delay for ENGINE V3 orders, in seconds.",
-    )
-    p.add_argument(
-        "--engine-v3-fill-horizon-sec",
-        type=float,
-        default=30.0,
-        help="Time after ENGINE V3 PLACE before requesting cancel for unfilled orders.",
-    )
-    p.add_argument(
-        "--engine-v3-cancel-delay-sec",
-        type=float,
-        default=5.0,
-        help="Cancel delay for ENGINE V3 orders, in seconds during in-play.",
     )
     return p.parse_args()
 
@@ -1524,19 +1467,6 @@ def _render_dashboard_printing(
         )
         print("\033[4;1H", end="")
 
-    _engine_v2_render_ladders_if_needed(
-        pt=int(pt),
-        markets=markets,
-        order_model=order_model,
-        show_queue=show_queue,
-        center_mode=center_mode,
-        ticks_above=ticks_above,
-        ticks_below=ticks_below,
-        ladder_max_rows=ladder_max_rows,
-        col_width=col_width,
-        paused=paused,
-    )
-
     if list_totals:
         # Print all totals (Over/Under Goals) markets at this frame, then exit.
         def fmt_best(r: RunnerState) -> tuple[str, str]:
@@ -2230,884 +2160,6 @@ def render_dashboard(
     sys.stdout.flush()
 
 
-def _engine_v2_log_event(
-    *,
-    event: str,
-    pt: int,
-    row: dict[str, object],
-    liability: float = 0.0,
-    free_balance: float = 0.0,
-    note: str = "",
-) -> None:
-    import csv
-    from pathlib import Path
-    from datetime import datetime, timezone
-
-    path = str(globals().get("ENGINE_V2_EXEC_LOG_PATH") or "")
-    if not path:
-        return
-
-    event_key = (
-        event,
-        str(row.get("signal_id") or ""),
-        str(row.get("market_type") or ""),
-        str(row.get("market_name") or ""),
-        str(row.get("runner_name") or ""),
-        str(row.get("entry_order_side") or ""),
-        str(row.get("price") or ""),
-        str(row.get("first_add_utc") or ""),
-        str(row.get("fill_utc") or ""),
-        str(row.get("exit_utc") or ""),
-    )
-
-    logged = globals().setdefault("ENGINE_V2_LOGGED_EVENTS", set())
-    if event_key in logged:
-        return
-    logged.add(event_key)
-
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-
-    write_header = not p.exists() or p.stat().st_size == 0
-
-    with p.open("a", newline="", encoding="utf-8") as f:
-        fields = [
-            "event",
-            "pt",
-            "utc",
-            "signal_id",
-            "market_type",
-            "market_name",
-            "runner_name",
-            "entry_order_side",
-            "book_side",
-            "price",
-            "stake",
-            "liability",
-            "free_balance",
-            "fill_utc",
-            "exit_utc",
-            "pnl_proxy",
-            "pnl_status",
-            "note",
-        ]
-        w = csv.DictWriter(f, fieldnames=fields)
-        if write_header:
-            w.writeheader()
-
-        utc = datetime.fromtimestamp(pt / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
-
-        w.writerow({
-            "event": event,
-            "pt": pt,
-            "utc": utc,
-            "signal_id": row.get("signal_id", ""),
-            "market_type": row.get("market_type", ""),
-            "market_name": row.get("market_name", ""),
-            "runner_name": row.get("runner_name", ""),
-            "entry_order_side": row.get("entry_order_side", ""),
-            "book_side": row.get("side", ""),
-            "price": row.get("price", ""),
-            "stake": row.get("stake", ""),
-            "liability": f"{float(liability):.6f}",
-            "free_balance": f"{float(free_balance):.6f}",
-            "fill_utc": row.get("fill_utc", ""),
-            "exit_utc": row.get("exit_utc", ""),
-            "pnl_proxy": row.get("pnl_proxy", ""),
-            "pnl_status": row.get("pnl_status", ""),
-            "note": note,
-        })
-
-
-def _engine_v3_order_key(order: V3Order) -> tuple[str, int, float | None, float, str]:
-    return (
-        order.market_id,
-        int(order.selection_id),
-        order.handicap,
-        float(order.price),
-        str(order.side),
-    )
-
-
-def _engine_v3_order_liability(order: V3Order) -> float:
-    return order.exposure()
-
-
-def _engine_v3_get_queue_ahead(runner: RunnerState, side: str, price: float) -> float:
-    px = float(price)
-    if side == "LAY":
-        return float(runner.available_to_back.get(px) or 0.0)
-    if side == "BACK":
-        return float(runner.available_to_lay.get(px) or 0.0)
-    return 0.0
-
-
-def _engine_v3_is_inplay_phase(row: dict[str, object]) -> bool:
-    phase = str(row.get("phase") or "").strip().upper()
-    if not phase:
-        return False
-    if "PRE" in phase or "BEFORE" in phase or "KICKOFF" in phase:
-        return False
-    return (
-        "IN_PLAY" in phase
-        or "INPLAY" in phase
-        or phase.startswith("NORMAL_")
-        or "FIRST_HALF" in phase
-        or "SECOND_HALF" in phase
-        or "HALF_TIME" in phase
-        or "EXTRA_TIME" in phase
-    )
-
-
-def _engine_v3_make_order_from_row(
-    row: dict[str, object],
-    st: MarketState,
-    runner: RunnerState,
-    pt: int,
-    utc: str,
-) -> V3Order:
-    side = str(row.get("entry_order_side") or "")
-    price = float(row.get("_price") or row.get("price") or 0.0)
-    stake = float(row.get("_stake") or row.get("stake") or 0.0)
-    signal_id = str(row.get("signal_id") or "")
-    order_id = str(
-        row.get("order_id")
-        or "|".join(
-            [
-                signal_id,
-                st.market_id,
-                str(runner.selection_id),
-                str(runner.handicap),
-                side,
-                f"{price:g}",
-                str(row.get("first_add_utc") or utc or pt),
-            ]
-        )
-    )
-
-    return V3Order(
-        order_id=order_id,
-        market_id=st.market_id,
-        selection_id=int(runner.selection_id),
-        handicap=runner.handicap,
-        market_type=st.market_type or str(row.get("market_type") or "") or None,
-        market_name=st.market_name or str(row.get("market_name") or "") or None,
-        runner_name=runner.name or str(row.get("runner_name") or "") or None,
-        side=side,
-        price=price,
-        stake=stake,
-        book_side=str(row.get("side") or ""),
-        remaining=stake,
-        matched=0.0,
-        avg_price=0.0,
-        queue_ahead_initial=0.0,
-        queue_ahead_remaining=0.0,
-        status=OrderStatus.REQUESTED_PLACE,
-        placed_pt=int(pt),
-        placed_utc=str(utc or ""),
-        fill_source="",
-    )
-
-
-def _engine_v3_log_event(
-    *,
-    event: str,
-    pt: int,
-    order: V3Order,
-    signal_id: str = "",
-    liability: float | None = None,
-    free_balance: float = 0.0,
-    queue_delta: float = 0.0,
-    matched_now: float = 0.0,
-    action_source: str = "",
-    action_count: int = 0,
-    action_amount: float = 0.0,
-    pnl_v3: float = 0.0,
-    matched_fraction: float = 0.0,
-    exit_utc: str = "",
-    exit_price: str = "",
-    settlement: str = "",
-    note: str = "",
-) -> None:
-    import csv
-    from pathlib import Path
-    from datetime import datetime, timezone
-
-    path = str(
-        globals().get("ENGINE_V3_EXEC_LOG_PATH")
-        or "replay/delta_10s_macro_min10/engine_v3_execution_log.csv"
-    )
-    if not path:
-        return
-
-    event_key = (
-        event,
-        str(order.order_id),
-        int(pt),
-        str(order.status.value),
-        f"{float(order.matched):.12f}",
-        f"{float(order.remaining):.12f}",
-        note,
-    )
-
-    logged = globals().setdefault("ENGINE_V3_LOGGED_EVENTS", set())
-    if event_key in logged:
-        return
-    logged.add(event_key)
-
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-
-    write_header = not p.exists() or p.stat().st_size == 0
-
-    fields = [
-        "event",
-        "pt",
-        "utc",
-        "order_id",
-        "signal_id",
-        "market_type",
-        "market_name",
-        "runner_name",
-        "side",
-        "price",
-        "stake",
-        "matched",
-        "remaining",
-        "queue_ahead_initial",
-        "queue_ahead_remaining",
-        "status",
-        "liability",
-        "free_balance",
-        "queue_delta",
-        "matched_now",
-        "action_source",
-        "action_count",
-        "action_amount",
-        "pnl_v3",
-        "matched_fraction",
-        "exit_utc",
-        "exit_price",
-        "settlement",
-        "note",
-    ]
-
-    utc = datetime.fromtimestamp(pt / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
-    liab = _engine_v3_order_liability(order) if liability is None else float(liability)
-
-    with p.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        if write_header:
-            w.writeheader()
-        w.writerow({
-            "event": event,
-            "pt": pt,
-            "utc": utc,
-            "order_id": order.order_id,
-            "signal_id": signal_id,
-            "market_type": order.market_type or "",
-            "market_name": order.market_name or "",
-            "runner_name": order.runner_name or "",
-            "side": order.side,
-            "price": f"{float(order.price):.6f}",
-            "stake": f"{float(order.stake):.6f}",
-            "matched": f"{float(order.matched):.6f}",
-            "remaining": f"{float(order.remaining):.6f}",
-            "queue_ahead_initial": f"{float(order.queue_ahead_initial):.6f}",
-            "queue_ahead_remaining": f"{float(order.queue_ahead_remaining):.6f}",
-            "status": order.status.value,
-            "liability": f"{liab:.6f}",
-            "free_balance": f"{float(free_balance):.6f}",
-            "queue_delta": f"{float(queue_delta):.6f}",
-            "matched_now": f"{float(matched_now):.6f}",
-            "action_source": action_source,
-            "action_count": int(action_count),
-            "action_amount": f"{float(action_amount):.6f}",
-            "pnl_v3": f"{float(pnl_v3):.6f}",
-            "matched_fraction": f"{float(matched_fraction):.6f}",
-            "exit_utc": exit_utc,
-            "exit_price": exit_price,
-            "settlement": settlement,
-            "note": note,
-        })
-
-
-def _engine_v3_load_action_log(path: str) -> list[dict[str, object]]:
-    import csv
-    from pathlib import Path
-
-    p = Path(path)
-    if not p.exists():
-        return []
-
-    events: list[dict[str, object]] = []
-    with p.open(newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            action = str(row.get("action") or "")
-            if action not in {"MATCH", "VISIBLE_REMOVE"}:
-                continue
-            try:
-                event_pt = _engine_v2_ts_ms(str(row.get("utc") or ""))
-                price = float(row.get("price") or 0.0)
-                amount = float(row.get("amount") or 0.0)
-            except Exception:
-                continue
-            if event_pt <= 0 or price <= 1.0 or amount <= 0.0:
-                continue
-            events.append({
-                "pt": event_pt,
-                "utc": row.get("utc", ""),
-                "action": action,
-                "market_type": row.get("market_type", ""),
-                "market_name": row.get("market_name", ""),
-                "runner_name": row.get("runner_name", ""),
-                "side": row.get("side", ""),
-                "price": price,
-                "amount": amount,
-            })
-    events.sort(key=lambda x: int(x.get("pt") or 0))
-    return events
-
-
-def _engine_v3_place_orders_only(
-    *,
-    pt: int,
-    utc: str,
-    markets: dict[str, MarketState],
-    rows: list[dict[str, object]],
-    runtime_orders: dict[str, V3Order],
-    balance: float | None,
-    place_delay_sec: float,
-) -> None:
-    for row in rows:
-        entry_ms = int(row.get("_entry_ms") or 0)
-        if entry_ms <= 0 or pt < entry_ms:
-            continue
-        phase = str(row.get("phase") or "")
-        inplay = _engine_v3_is_inplay_phase(row)
-        effective_delay_sec = max(0.0, float(place_delay_sec)) if inplay else 0.0
-        effective_delay_ms = int(effective_delay_sec * 1000.0)
-
-        order: V3Order | None = None
-        st: MarketState | None = None
-        runner: RunnerState | None = None
-        runtime_order_id = str(row.get("_engine_v3_order_id") or "")
-
-        if runtime_order_id:
-            order = runtime_orders.get(runtime_order_id)
-
-        if order is None:
-            st, runner = _engine_v2_find_runner(markets=markets, row=row)
-            if st is None or runner is None:
-                continue
-
-            order = _engine_v3_make_order_from_row(row, st, runner, entry_ms, str(row.get("first_add_utc") or ""))
-            row["_engine_v3_order_id"] = order.order_id
-            if order.order_id in runtime_orders:
-                order = runtime_orders[order.order_id]
-            else:
-                runtime_orders[order.order_id] = order
-                bal = 0.0 if balance is None else float(balance)
-                _engine_v3_log_event(
-                    event="REQUEST_PLACE",
-                    pt=pt,
-                    order=order,
-                    signal_id=str(row.get("signal_id") or ""),
-                    liability=0.0,
-                    free_balance=bal,
-                    note=f"requested_place phase={phase} inplay={inplay} place_delay_sec={effective_delay_sec:g}",
-                )
-
-        if order.status != OrderStatus.REQUESTED_PLACE:
-            continue
-        if pt < entry_ms + effective_delay_ms:
-            continue
-
-        if st is None or runner is None:
-            st, runner = _engine_v2_find_runner(markets=markets, row=row)
-            if st is None or runner is None:
-                continue
-
-        queue_ahead = _engine_v3_get_queue_ahead(runner, order.side, order.price)
-        order.queue_ahead_initial = queue_ahead
-        order.queue_ahead_remaining = queue_ahead
-        order.current_queue_size = queue_ahead
-        order.previous_queue_size = queue_ahead
-        order.status = OrderStatus.OPEN
-        order.placed_pt = int(pt)
-        order.placed_utc = str(utc or "")
-        order.inplay = bool(inplay)
-
-        locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
-        bal = 0.0 if balance is None else float(balance)
-        _engine_v3_log_event(
-            event="PLACE",
-            pt=pt,
-            order=order,
-            signal_id=str(row.get("signal_id") or ""),
-            liability=_engine_v3_order_liability(order),
-            free_balance=bal - locked,
-            note=f"placed_after_delay phase={phase} inplay={inplay} place_delay_sec={effective_delay_sec:g}",
-        )
-
-
-def _engine_v3_find_order_runner(
-    *,
-    markets: dict[str, MarketState],
-    order: V3Order,
-) -> RunnerState | None:
-    st = markets.get(order.market_id)
-    if st is None:
-        return None
-
-    runner = st.runners.get(int(order.selection_id))
-    if runner is None or runner.handicap != order.handicap:
-        return None
-    return runner
-
-
-def _engine_v3_update_queue_fills(
-    *,
-    pt: int,
-    markets: dict[str, MarketState],
-    runtime_orders: dict[str, V3Order],
-    balance: float | None,
-) -> None:
-    for order in runtime_orders.values():
-        if not order.is_active():
-            continue
-        if order.placed_pt == pt:
-            continue
-
-        runner = _engine_v3_find_order_runner(markets=markets, order=order)
-        if runner is None:
-            continue
-
-        current_queue = _engine_v3_get_queue_ahead(runner, order.side, order.price)
-        previous_queue = order.previous_queue_size
-        order.current_queue_size = current_queue
-        if previous_queue is None or current_queue >= previous_queue:
-            order.previous_queue_size = current_queue
-            continue
-
-        queue_delta = previous_queue - current_queue
-        matched_now = order.apply_queue_delta(queue_delta)
-        order.previous_queue_size = current_queue
-        if matched_now <= 0:
-            continue
-        if order.first_fill_pt <= 0:
-            order.first_fill_pt = int(pt)
-
-        locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
-        bal = 0.0 if balance is None else float(balance)
-        event = "FILL" if order.status == OrderStatus.FILLED else "PARTIAL_FILL"
-        _engine_v3_log_event(
-            event=event,
-            pt=pt,
-            order=order,
-            liability=_engine_v3_order_liability(order),
-            free_balance=bal - locked,
-            queue_delta=queue_delta,
-            matched_now=matched_now,
-            note="queue_delta",
-        )
-
-
-def _engine_v3_action_matches_order(event: dict[str, object], order: V3Order) -> bool:
-    return (
-        str(event.get("market_type") or "") == str(order.market_type or "")
-        and str(event.get("market_name") or "") == str(order.market_name or "")
-        and str(event.get("runner_name") or "") == str(order.runner_name or "")
-        and str(event.get("side") or "") == str(order.book_side or "")
-        and abs(float(event.get("price") or 0.0) - float(order.price)) < 1e-9
-    )
-
-
-def _engine_v3_update_action_log_fills(
-    *,
-    pt: int,
-    events: list[dict[str, object]],
-    runtime_orders: dict[str, V3Order],
-    balance: float | None,
-    fill_source: str,
-) -> None:
-    if not events:
-        return
-
-    allowed_actions = {"MATCH"}
-    if fill_source == "match_plus_visible_remove":
-        allowed_actions.add("VISIBLE_REMOVE")
-
-    for order in runtime_orders.values():
-        if not order.is_active():
-            continue
-
-        queue_delta = 0.0
-        action_counts: dict[str, int] = {}
-        action_amounts: dict[str, float] = {}
-        for event in events:
-            if int(event.get("pt") or 0) <= int(order.placed_pt):
-                continue
-            action = str(event.get("action") or "")
-            if action not in allowed_actions:
-                continue
-            if _engine_v3_action_matches_order(event, order):
-                amount = float(event.get("amount") or 0.0)
-                queue_delta += amount
-                action_counts[action] = action_counts.get(action, 0) + 1
-                action_amounts[action] = action_amounts.get(action, 0.0) + amount
-
-        if queue_delta <= 0.0:
-            continue
-
-        matched_now = order.apply_queue_delta(queue_delta)
-        if matched_now <= 0.0:
-            continue
-        if order.first_fill_pt <= 0:
-            order.first_fill_pt = int(pt)
-
-        locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
-        bal = 0.0 if balance is None else float(balance)
-        event_name = "FILL" if order.status == OrderStatus.FILLED else "PARTIAL_FILL"
-        action_source = "+".join(sorted(action_counts))
-        _engine_v3_log_event(
-            event=event_name,
-            pt=pt,
-            order=order,
-            liability=_engine_v3_order_liability(order),
-            free_balance=bal - locked,
-            queue_delta=queue_delta,
-            matched_now=matched_now,
-            action_source=action_source,
-            action_count=sum(action_counts.values()),
-            action_amount=sum(action_amounts.values()),
-            note="action_log_consumption",
-        )
-
-
-def _engine_v3_update_cancel_horizon(
-    *,
-    pt: int,
-    runtime_orders: dict[str, V3Order],
-    balance: float | None,
-    fill_horizon_sec: float,
-    cancel_delay_sec: float,
-) -> None:
-    horizon_ms = max(0, int(float(fill_horizon_sec) * 1000.0))
-    cancel_delay_ms = max(0, int(float(cancel_delay_sec) * 1000.0))
-
-    for order in runtime_orders.values():
-        if order.status in {
-            OrderStatus.REQUESTED_PLACE,
-            OrderStatus.FILLED,
-            OrderStatus.CANCELLED,
-            OrderStatus.EXITED,
-            OrderStatus.SETTLED,
-        }:
-            continue
-
-        if order.remaining <= 0:
-            continue
-
-        if order.fill_deadline_pt <= 0 and order.placed_pt > 0:
-            order.fill_deadline_pt = int(order.placed_pt) + horizon_ms
-
-        if (
-            order.status in {OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED}
-            and order.fill_deadline_pt > 0
-            and pt >= order.fill_deadline_pt
-        ):
-            order.status = OrderStatus.REQUESTED_CANCEL
-            order.cancel_requested_pt = int(pt)
-            effective_delay_ms = cancel_delay_ms if bool(order.inplay) else 0
-            order.cancel_effective_pt = int(pt) + effective_delay_ms
-            locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
-            bal = 0.0 if balance is None else float(balance)
-            _engine_v3_log_event(
-                event="REQUEST_CANCEL",
-                pt=pt,
-                order=order,
-                liability=_engine_v3_order_liability(order),
-                free_balance=bal - locked,
-                note=(
-                    f"fill_horizon_sec={float(fill_horizon_sec):g} "
-                    f"cancel_delay_sec={(effective_delay_ms / 1000.0):g} "
-                    f"inplay={bool(order.inplay)}"
-                ),
-            )
-
-        if order.status != OrderStatus.REQUESTED_CANCEL:
-            continue
-        if order.cancel_effective_pt <= 0 or pt < order.cancel_effective_pt:
-            continue
-        if order.remaining <= 0:
-            continue
-
-        event_name = "CANCEL_REMAINING" if order.matched > 0 else "CANCEL"
-        order.cancel_remaining()
-        locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
-        bal = 0.0 if balance is None else float(balance)
-        _engine_v3_log_event(
-            event=event_name,
-            pt=pt,
-            order=order,
-            liability=_engine_v3_order_liability(order),
-            free_balance=bal - locked,
-            note=(
-                f"fill_horizon_sec={float(fill_horizon_sec):g} "
-                f"cancel_delay_sec={(cancel_delay_ms if bool(order.inplay) else 0) / 1000.0:g} "
-                f"inplay={bool(order.inplay)}"
-            ),
-        )
-
-
-
-def _engine_v3_get_fallback_exit_from_action_log(
-    *,
-    row: dict[str, object],
-    order: V3Order,
-) -> tuple[float | None, str]:
-    events = globals().get("ENGINE_V3_ACTION_EVENTS") or []
-
-    if not events:
-        import csv
-        from pathlib import Path
-
-        p = Path(str(globals().get("ENGINE_V3_ACTION_LOG_PATH") or "replay/delta_10s/action_log.csv"))
-        loaded: list[dict[str, object]] = []
-
-        if p.exists():
-            with p.open(newline="", encoding="utf-8") as f:
-                for r in csv.DictReader(f):
-                    action = str(r.get("action") or "")
-                    if action not in {"MATCH", "VISIBLE_REMOVE"}:
-                        continue
-                    try:
-                        pt = _engine_v2_ts_ms(str(r.get("utc") or ""))
-                        price = float(r.get("price") or 0.0)
-                        amount = float(r.get("amount") or 0.0)
-                    except Exception:
-                        continue
-                    if pt <= 0 or price <= 1.0 or amount <= 0.0:
-                        continue
-                    loaded.append({
-                        "pt": pt,
-                        "utc": r.get("utc", ""),
-                        "action": action,
-                        "market_type": r.get("market_type", ""),
-                        "market_name": r.get("market_name", ""),
-                        "runner_name": r.get("runner_name", ""),
-                        "side": r.get("side", ""),
-                        "price": price,
-                        "amount": amount,
-                    })
-
-        loaded.sort(key=lambda x: int(x.get("pt") or 0))
-        globals()["ENGINE_V3_ACTION_EVENTS"] = loaded
-        events = loaded
-
-    if not events or order.first_fill_pt <= 0 or order.matched <= 0:
-        return None, ""
-
-    market_type = str(order.market_type or "")
-    market_name = str(order.market_name or "")
-    runner_name = str(order.runner_name or "")
-
-    exit_side = str(row.get("exit_side") or "")
-    if not exit_side:
-        exit_side = "ATL" if str(order.side) == "LAY" else "ATB"
-
-    first_fill_pt = int(order.first_fill_pt)
-    need_amount = float(order.matched)
-
-    for ev in events:
-        try:
-            ev_pt = int(ev.get("pt") or 0)
-            price = float(ev.get("price") or 0.0)
-            amount = float(ev.get("amount") or 0.0)
-        except Exception:
-            continue
-
-        if ev_pt <= first_fill_pt:
-            continue
-        if price <= 1.0 or amount < need_amount:
-            continue
-        if market_type and str(ev.get("market_type") or "") != market_type:
-            continue
-        if market_name and str(ev.get("market_name") or "") != market_name:
-            continue
-        if runner_name and str(ev.get("runner_name") or "") != runner_name:
-            continue
-        if exit_side and str(ev.get("side") or "") != exit_side:
-            continue
-
-        return price, str(ev.get("utc") or "")
-
-    return None, ""
-
-
-def _engine_v3_calc_exit_pnl(
-    *,
-    side: str,
-    entry_price: float,
-    exit_price: float,
-    matched: float,
-) -> float:
-    if matched <= 0.0 or entry_price <= 1.0 or exit_price <= 1.0:
-        return 0.0
-
-    if side == "LAY":
-        return float(matched) * (float(entry_price) - float(exit_price)) / float(exit_price)
-
-    if side == "BACK":
-        return float(matched) * (float(exit_price) - float(entry_price)) / float(entry_price)
-
-    return 0.0
-
-
-
-def _engine_v3_update_exit_settle(
-    *,
-    pt: int,
-    rows: list[dict[str, object]],
-    runtime_orders: dict[str, V3Order],
-    balance: float | None,
-) -> None:
-    for row in rows:
-        order_id = str(row.get("_engine_v3_order_id") or "")
-        if not order_id:
-            continue
-
-        order = runtime_orders.get(order_id)
-        if order is None:
-            continue
-        if order.status == OrderStatus.SETTLED:
-            continue
-        if order.matched <= 0.0 or order.stake <= 0.0:
-            continue
-
-        exit_ms = int(row.get("_exit_ms") or 0)
-        if exit_ms <= 0 or pt < exit_ms:
-            continue
-        if order.first_fill_pt > 0 and exit_ms < int(order.first_fill_pt):
-            fallback_exit_price, fallback_exit_utc = _engine_v3_get_fallback_exit_from_action_log(
-                row=row,
-                order=order,
-            )
-
-            if fallback_exit_price is None:
-                if order.late_fill_no_valid_exit_pt <= 0:
-                    order.late_fill_no_valid_exit_pt = int(pt)
-                    locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
-                    bal = 0.0 if balance is None else float(balance)
-                    _engine_v3_log_event(
-                        event="LATE_FILL_NO_VALID_EXIT",
-                        pt=pt,
-                        order=order,
-                        signal_id=str(row.get("signal_id") or ""),
-                        liability=_engine_v3_order_liability(order),
-                        free_balance=bal - locked,
-                        pnl_v3=0.0,
-                        matched_fraction=min(1.0, max(0.0, float(order.matched) / float(order.stake))),
-                        exit_utc=str(row.get("exit_utc") or ""),
-                        exit_price=str(row.get("exit_price") or row.get("price") or ""),
-                        settlement="",
-                        note="exit_before_actual_fill",
-                    )
-                continue
-
-            matched_fraction = min(1.0, max(0.0, float(order.matched) / float(order.stake)))
-            pnl_v3 = _engine_v3_calc_exit_pnl(
-                side=str(order.side),
-                entry_price=float(order.price),
-                exit_price=float(fallback_exit_price),
-                matched=float(order.matched),
-            )
-
-            locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
-            bal = 0.0 if balance is None else float(balance)
-
-            order.status = OrderStatus.EXITED
-            order.exited_pt = int(pt)
-            order.pnl_v3 = pnl_v3
-
-            _engine_v3_log_event(
-                event="EXIT",
-                pt=pt,
-                order=order,
-                signal_id=str(row.get("signal_id") or ""),
-                liability=_engine_v3_order_liability(order),
-                free_balance=bal - locked,
-                pnl_v3=pnl_v3,
-                matched_fraction=matched_fraction,
-                exit_utc=fallback_exit_utc,
-                exit_price=f"{float(fallback_exit_price):.6f}",
-                settlement="fallback_after_fill",
-                note="fallback_exit_after_fill",
-            )
-
-            order.status = OrderStatus.SETTLED
-            order.settled_pt = int(pt)
-
-            _engine_v3_log_event(
-                event="SETTLE",
-                pt=pt,
-                order=order,
-                signal_id=str(row.get("signal_id") or ""),
-                liability=0.0,
-                free_balance=bal + pnl_v3 - locked,
-                pnl_v3=pnl_v3,
-                matched_fraction=matched_fraction,
-                exit_utc=fallback_exit_utc,
-                exit_price=f"{float(fallback_exit_price):.6f}",
-                settlement="fallback_after_fill",
-                note="settlement=fallback_after_fill",
-            )
-            continue
-
-        matched_fraction = min(1.0, max(0.0, float(order.matched) / float(order.stake)))
-        pnl_v3 = float(row.get("_pnl") or row.get("pnl_proxy") or 0.0) * matched_fraction
-        exit_utc = str(row.get("exit_utc") or "")
-        exit_price = str(row.get("exit_price") or row.get("price") or "")
-        locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
-        bal = 0.0 if balance is None else float(balance)
-
-        order.status = OrderStatus.EXITED
-        order.exited_pt = int(pt)
-        order.pnl_v3 = pnl_v3
-        _engine_v3_log_event(
-            event="EXIT",
-            pt=pt,
-            order=order,
-            signal_id=str(row.get("signal_id") or ""),
-            liability=_engine_v3_order_liability(order),
-            free_balance=bal - locked,
-            pnl_v3=pnl_v3,
-            matched_fraction=matched_fraction,
-            exit_utc=exit_utc,
-            exit_price=exit_price,
-            settlement="proxy_proportional",
-            note="exit_matched_part",
-        )
-
-        order.status = OrderStatus.SETTLED
-        order.settled_pt = int(pt)
-        _engine_v3_log_event(
-            event="SETTLE",
-            pt=pt,
-            order=order,
-            signal_id=str(row.get("signal_id") or ""),
-            liability=0.0,
-            free_balance=bal + pnl_v3 - locked,
-            pnl_v3=pnl_v3,
-            matched_fraction=matched_fraction,
-            exit_utc=exit_utc,
-            exit_price=exit_price,
-            settlement="proxy_proportional",
-            note="settlement=proxy_proportional",
-        )
-
-
 def _engine_v2_find_runner(
     *,
     markets: dict[str, MarketState],
@@ -3129,133 +2181,6 @@ def _engine_v2_find_runner(
 
     return None, None
 
-
-def _engine_v2_render_ladders_if_needed(
-    *,
-    pt: int,
-    markets: dict[str, MarketState],
-    order_model: OrderModel,
-    show_queue: bool,
-    center_mode: str,
-    ticks_above: int,
-    ticks_below: int,
-    ladder_max_rows: int,
-    col_width: int,
-    paused: bool = False,
-) -> None:
-    if not bool(globals().get("ENGINE_V2_SHOW_MARKETS", False)):
-        return
-
-    # Do not redraw variable-size V2 ladder block while stream is running.
-    # This prevents dashboard jumping. Press PAUSE to inspect V2 ladders.
-    if not paused:
-        return
-
-    orders = globals().get("ENGINE_V2_RUNTIME_ORDERS", [])
-    if not orders:
-        return
-
-    allowed = {
-        "MATCH_ODDS",
-        "OVER_UNDER_15",
-        "OVER_UNDER_25",
-        "OVER_UNDER_35",
-        "OVER_UNDER_45",
-        "TOTAL_GOALS",
-        "TEAM_TOTAL_GOALS",
-        "FIRST_HALF_GOALS_05",
-    }
-
-    cols: list[list[str]] = []
-    seen: set[tuple[str, str, str]] = set()
-
-    for r in orders:
-        mt = str(r.get("market_type") or "")
-        if mt not in allowed:
-            continue
-
-        entry = int(r.get("_entry_ms") or 0)
-        fill = int(r.get("_fill_ms") or 0)
-        exit_ms = int(r.get("_exit_ms") or 0)
-
-        if entry <= 0:
-            continue
-
-        # Show shortly before entry, while active, and shortly after exit.
-        end_ms = exit_ms if exit_ms else (fill if fill else entry + 60000)
-        if not (entry - 10000 <= pt <= end_ms + 5000):
-            continue
-
-        st, runner = _engine_v2_find_runner(markets=markets, row=r)
-        if st is None or runner is None:
-            continue
-
-        price = float(r.get("_price") or r.get("price") or 0.0)
-        if price <= 1.0:
-            continue
-
-        key = (
-            str(r.get("market_type") or ""),
-            str(r.get("market_name") or ""),
-            str(r.get("runner_name") or ""),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-
-        if pt < entry:
-            status = "NEXT"
-        elif fill and pt >= fill and (not exit_ms or pt < exit_ms):
-            status = "FILLED"
-        elif exit_ms and pt >= exit_ms:
-            status = "EXIT"
-        else:
-            status = "LIVE"
-
-        side = str(r.get("entry_order_side") or "")
-        stake = float(r.get("_stake") or r.get("stake") or 0.0)
-        if side == "LAY":
-            liab = stake * max(0.0, price - 1.0)
-        elif side == "BACK":
-            liab = stake
-        else:
-            liab = 0.0
-
-        lo = max(1.01, price - 0.25)
-        hi = price + 0.25
-
-        title = (
-            f"ENGINE_V2 {status} S{r.get('signal_id')} "
-            f"{mt} {side}@{price:g} stake={stake:g} liab={liab:.2f}"
-        )
-
-        ladder_lines = render_runner_ladder(
-            runner,
-            market_id=st.market_id,
-            center_mode=center_mode,
-            ticks_above=ticks_above,
-            ticks_below=ticks_below,
-            nonempty_only=False,
-            max_rows=int(ladder_max_rows or 12),
-            my_col_width=5,
-            order_model=order_model,
-            show_queue=show_queue,
-            price_low=lo,
-            price_high=hi,
-        )
-
-        cols.append([title] + ladder_lines)
-
-        if len(cols) >= int(globals().get("ENGINE_V2_MAX_LADDERS", 3)):
-            break
-
-    if not cols:
-        return
-
-    print()
-    print("ENGINE V2 LADDERS")
-    print_columns(cols, col_width=max(42, int(col_width)), gap="  ")
-    print("-" * 110)
 
 def _engine_v2_current_locked_and_pnl(
     *,
@@ -3298,9 +2223,6 @@ def _engine_v2_apply_orders_to_order_model(
         shown as MYL
     """
     for r in orders:
-        if bool(r.get("_engine_v2_settled", False)):
-            continue
-
         entry_ms = int(r.get("_entry_ms") or 0)
         fill_ms = int(r.get("_fill_ms") or 0)
         exit_ms = int(r.get("_exit_ms") or 0)
@@ -3309,12 +2231,7 @@ def _engine_v2_apply_orders_to_order_model(
             continue
 
         # 1) settle after exit
-        if (
-            exit_ms
-            and pt >= exit_ms
-            and bool(r.get("_engine_v2_placed", False))
-            and (not fill_ms or bool(r.get("_engine_v2_filled", False)))
-        ):
+        if exit_ms and pt >= exit_ms and bool(r.get("_engine_v2_placed", False)):
             key = r.get("_engine_v2_order_key")
             if key in order_model.by_key:
                 my = order_model.by_key[key]
@@ -3325,19 +2242,11 @@ def _engine_v2_apply_orders_to_order_model(
                     my.matched += my.my_back
                     my.my_back = 0.0
 
-            _engine_v2_log_event(
-                event="EXIT",
-                pt=pt,
-                row=r,
-                liability=float(r.get("_engine_v2_liability") or 0.0),
-                free_balance=_engine_v2_current_locked_and_pnl(orders=orders, balance=balance)[2],
-                note="exit_proxy",
-            )
             r["_engine_v2_settled"] = True
             continue
 
         # 2) fill after fill_utc
-        if fill_ms and pt >= fill_ms and bool(r.get("_engine_v2_placed", False)) and not bool(r.get("_engine_v2_filled", False)):
+        if fill_ms and pt >= fill_ms and bool(r.get("_engine_v2_placed", False)):
             key = r.get("_engine_v2_order_key")
             if key in order_model.by_key:
                 my = order_model.by_key[key]
@@ -3347,14 +2256,6 @@ def _engine_v2_apply_orders_to_order_model(
                 if my.my_back > 0:
                     my.matched += my.my_back
                     my.my_back = 0.0
-            _engine_v2_log_event(
-                event="FILL",
-                pt=pt,
-                row=r,
-                liability=float(r.get("_engine_v2_liability") or 0.0),
-                free_balance=_engine_v2_current_locked_and_pnl(orders=orders, balance=balance)[2],
-                note="fill_proxy",
-            )
             r["_engine_v2_filled"] = True
             continue
 
@@ -3368,14 +2269,6 @@ def _engine_v2_apply_orders_to_order_model(
         if st is None or runner is None:
             r["_engine_v2_skipped"] = True
             r["_engine_v2_skip_reason"] = "MARKET_OR_RUNNER_NOT_FOUND"
-            _engine_v2_log_event(
-                event="SKIP",
-                pt=pt,
-                row=r,
-                liability=0.0,
-                free_balance=_engine_v2_current_locked_and_pnl(orders=orders, balance=balance)[2],
-                note="MARKET_OR_RUNNER_NOT_FOUND",
-            )
             continue
 
         side = str(r.get("entry_order_side") or "")
@@ -3404,14 +2297,6 @@ def _engine_v2_apply_orders_to_order_model(
         if free + 1e-9 < liability:
             r["_engine_v2_skipped"] = True
             r["_engine_v2_skip_reason"] = "NO_FREE_BALANCE"
-            _engine_v2_log_event(
-                event="SKIP",
-                pt=pt,
-                row=r,
-                liability=liability,
-                free_balance=free,
-                note="NO_FREE_BALANCE",
-            )
             continue
 
         key = (st.market_id, int(runner.selection_id), runner.handicap, float(price))
@@ -3428,15 +2313,6 @@ def _engine_v2_apply_orders_to_order_model(
         r["_engine_v2_order_key"] = key
         r["_engine_v2_liability"] = liability
         r["_engine_v2_skip_reason"] = ""
-
-        _engine_v2_log_event(
-            event="PLACE",
-            pt=pt,
-            row=r,
-            liability=liability,
-            free_balance=free,
-            note="placed",
-        )
 
 def update_order_model_from_current_ladder(
     *,
@@ -3480,14 +2356,6 @@ def update_order_model_from_current_ladder(
 
 ENGINE_V2_OVERLAY_LINE = ""
 ENGINE_V2_TAPE_LINE = ""
-ENGINE_V2_RUNTIME_ORDERS = []
-ENGINE_V2_SHOW_MARKETS = False
-ENGINE_V2_MAX_LADDERS = 3
-ENGINE_V2_EXEC_LOG_PATH = ""
-ENGINE_V2_LOGGED_EVENTS = set()
-ENGINE_V3_RUNTIME_ORDERS = {}
-ENGINE_V3_EXEC_LOG_PATH = ""
-ENGINE_V3_LOGGED_EVENTS = set()
 
 def _engine_v2_ts_ms(s: str) -> int:
     from datetime import datetime
@@ -3690,25 +2558,12 @@ def stream_replay(args: argparse.Namespace) -> int:
     order_model = OrderModel()
 
     engine_v2_orders = []
-    if bool(getattr(args, "engine_v2_overlay", False)) or bool(getattr(args, "engine_v3_overlay", False)):
+    if bool(getattr(args, "engine_v2_overlay", False)):
         engine_v2_orders = _engine_v2_load_orders(str(getattr(args, "engine_v2_orders", "")))
-    engine_v3_action_events = []
-    if bool(getattr(args, "engine_v3_overlay", False)):
-        engine_v3_action_events = _engine_v3_load_action_log(str(getattr(args, "engine_v3_action_log", "")))
-    engine_v3_action_index = 0
-
-    globals()["ENGINE_V2_RUNTIME_ORDERS"] = engine_v2_orders
-    globals()["ENGINE_V2_SHOW_MARKETS"] = bool(getattr(args, "engine_v2_show_markets", False))
-    globals()["ENGINE_V2_MAX_LADDERS"] = max(1, int(getattr(args, "engine_v2_max_ladders", 3)))
-    globals()["ENGINE_V2_EXEC_LOG_PATH"] = str(getattr(args, "engine_v2_exec_log", ""))
-    globals()["ENGINE_V2_MAX_LADDERS"] = max(1, int(getattr(args, "engine_v2_max_ladders", 3)))
-    globals()["ENGINE_V3_RUNTIME_ORDERS"] = {}
-    globals()["ENGINE_V3_EXEC_LOG_PATH"] = str(getattr(args, "engine_v3_exec_log", ""))
 
     seeded_under_lay_grid: set[tuple[str, int, float | None, float]] = set()
     frames = 0
     next_frame_pt: int | None = None
-    previous_frame_pt: int | None = None
     cadence_ms = max(1, int(args.cadence_ms))
     earliest_start_pt: int | None = None
 
@@ -3976,66 +2831,25 @@ def stream_replay(args: argparse.Namespace) -> int:
                             balance=balance,
                         )
 
-                    if bool(getattr(args, "engine_v3_overlay", False)):
-                        frame_action_events: list[dict[str, object]] = []
-                        while (
-                            engine_v3_action_index < len(engine_v3_action_events)
-                            and int(engine_v3_action_events[engine_v3_action_index].get("pt") or 0) <= int(next_frame_pt)
-                        ):
-                            event = engine_v3_action_events[engine_v3_action_index]
-                            event_pt = int(event.get("pt") or 0)
-                            if previous_frame_pt is None or previous_frame_pt < event_pt:
-                                frame_action_events.append(event)
-                            engine_v3_action_index += 1
-
-                        _engine_v3_place_orders_only(
-                            pt=int(next_frame_pt),
-                            utc=format_pt(next_frame_pt),
-                            markets=markets,
-                            rows=engine_v2_orders,
-                            runtime_orders=globals()["ENGINE_V3_RUNTIME_ORDERS"],
-                            balance=balance,
-                            place_delay_sec=float(getattr(args, "engine_v3_place_delay_sec", 5.0)),
-                        )
-                        _engine_v3_update_action_log_fills(
-                            pt=int(next_frame_pt),
-                            events=frame_action_events,
-                            runtime_orders=globals()["ENGINE_V3_RUNTIME_ORDERS"],
-                            balance=balance,
-                            fill_source=str(getattr(args, "engine_v3_fill_source", "match_only")),
-                        )
-                        _engine_v3_update_cancel_horizon(
-                            pt=int(next_frame_pt),
-                            runtime_orders=globals()["ENGINE_V3_RUNTIME_ORDERS"],
-                            balance=balance,
-                            fill_horizon_sec=float(getattr(args, "engine_v3_fill_horizon_sec", 30.0)),
-                            cancel_delay_sec=float(getattr(args, "engine_v3_cancel_delay_sec", 5.0)),
-                        )
-                        _engine_v3_update_exit_settle(
-                            pt=int(next_frame_pt),
-                            rows=engine_v2_orders,
-                            runtime_orders=globals()["ENGINE_V3_RUNTIME_ORDERS"],
-                            balance=balance,
-                        )
-
                     update_order_model_from_current_ladder(
                         markets=markets,
                         order_model=order_model,
                     )
 
+                    global ENGINE_V2_OVERLAY_LINE
                     if bool(getattr(args, "engine_v2_overlay", False)):
-                        globals()["ENGINE_V2_OVERLAY_LINE"] = _engine_v2_overlay_line(
+                        ENGINE_V2_OVERLAY_LINE = _engine_v2_overlay_line(
                             pt=int(next_frame_pt),
                             balance=balance,
                             orders=engine_v2_orders,
                         )
-                        globals()["ENGINE_V2_TAPE_LINE"] = _engine_v2_tape_line(
+                        ENGINE_V2_TAPE_LINE = _engine_v2_tape_line(
                             pt=int(next_frame_pt),
                             orders=engine_v2_orders,
                         )
                     else:
-                        globals()["ENGINE_V2_OVERLAY_LINE"] = ""
-                        globals()["ENGINE_V2_TAPE_LINE"] = ""
+                        ENGINE_V2_OVERLAY_LINE = ""
+                        ENGINE_V2_TAPE_LINE = ""
 
                     if args.emit_json:
                         payload = build_emit_json_frame(
@@ -4292,7 +3106,6 @@ def stream_replay(args: argparse.Namespace) -> int:
                     if args.delay and args.delay > 0:
                         time.sleep(args.delay or DEFAULT_DELAY_SECONDS)
 
-                    previous_frame_pt = int(next_frame_pt)
                     next_frame_pt += cadence_ms
 
         return 0
