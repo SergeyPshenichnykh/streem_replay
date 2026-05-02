@@ -614,6 +614,18 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="Placement delay for ENGINE V3 orders, in seconds.",
     )
+    p.add_argument(
+        "--engine-v3-fill-horizon-sec",
+        type=float,
+        default=30.0,
+        help="Time after ENGINE V3 PLACE before requesting cancel for unfilled orders.",
+    )
+    p.add_argument(
+        "--engine-v3-cancel-delay-sec",
+        type=float,
+        default=5.0,
+        help="Cancel delay for ENGINE V3 orders, in seconds during in-play.",
+    )
     return p.parse_args()
 
 
@@ -2609,6 +2621,7 @@ def _engine_v3_place_orders_only(
         order.status = OrderStatus.OPEN
         order.placed_pt = int(pt)
         order.placed_utc = str(utc or "")
+        order.inplay = bool(inplay)
 
         locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
         bal = 0.0 if balance is None else float(balance)
@@ -2750,6 +2763,82 @@ def _engine_v3_update_action_log_fills(
             action_count=sum(action_counts.values()),
             action_amount=sum(action_amounts.values()),
             note="action_log_consumption",
+        )
+
+
+def _engine_v3_update_cancel_horizon(
+    *,
+    pt: int,
+    runtime_orders: dict[str, V3Order],
+    balance: float | None,
+    fill_horizon_sec: float,
+    cancel_delay_sec: float,
+) -> None:
+    horizon_ms = max(0, int(float(fill_horizon_sec) * 1000.0))
+    cancel_delay_ms = max(0, int(float(cancel_delay_sec) * 1000.0))
+
+    for order in runtime_orders.values():
+        if order.status in {
+            OrderStatus.REQUESTED_PLACE,
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+            OrderStatus.EXITED,
+            OrderStatus.SETTLED,
+        }:
+            continue
+
+        if order.remaining <= 0:
+            continue
+
+        if order.fill_deadline_pt <= 0 and order.placed_pt > 0:
+            order.fill_deadline_pt = int(order.placed_pt) + horizon_ms
+
+        if (
+            order.status in {OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED}
+            and order.fill_deadline_pt > 0
+            and pt >= order.fill_deadline_pt
+        ):
+            order.status = OrderStatus.REQUESTED_CANCEL
+            order.cancel_requested_pt = int(pt)
+            effective_delay_ms = cancel_delay_ms if bool(order.inplay) else 0
+            order.cancel_effective_pt = int(pt) + effective_delay_ms
+            locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
+            bal = 0.0 if balance is None else float(balance)
+            _engine_v3_log_event(
+                event="REQUEST_CANCEL",
+                pt=pt,
+                order=order,
+                liability=_engine_v3_order_liability(order),
+                free_balance=bal - locked,
+                note=(
+                    f"fill_horizon_sec={float(fill_horizon_sec):g} "
+                    f"cancel_delay_sec={(effective_delay_ms / 1000.0):g} "
+                    f"inplay={bool(order.inplay)}"
+                ),
+            )
+
+        if order.status != OrderStatus.REQUESTED_CANCEL:
+            continue
+        if order.cancel_effective_pt <= 0 or pt < order.cancel_effective_pt:
+            continue
+        if order.remaining <= 0:
+            continue
+
+        event_name = "CANCEL_REMAINING" if order.matched > 0 else "CANCEL"
+        order.cancel_remaining()
+        locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
+        bal = 0.0 if balance is None else float(balance)
+        _engine_v3_log_event(
+            event=event_name,
+            pt=pt,
+            order=order,
+            liability=_engine_v3_order_liability(order),
+            free_balance=bal - locked,
+            note=(
+                f"fill_horizon_sec={float(fill_horizon_sec):g} "
+                f"cancel_delay_sec={(cancel_delay_ms if bool(order.inplay) else 0) / 1000.0:g} "
+                f"inplay={bool(order.inplay)}"
+            ),
         )
 
 
@@ -3648,6 +3737,13 @@ def stream_replay(args: argparse.Namespace) -> int:
                             runtime_orders=globals()["ENGINE_V3_RUNTIME_ORDERS"],
                             balance=balance,
                             fill_source=str(getattr(args, "engine_v3_fill_source", "match_only")),
+                        )
+                        _engine_v3_update_cancel_horizon(
+                            pt=int(next_frame_pt),
+                            runtime_orders=globals()["ENGINE_V3_RUNTIME_ORDERS"],
+                            balance=balance,
+                            fill_horizon_sec=float(getattr(args, "engine_v3_fill_horizon_sec", 30.0)),
+                            cancel_delay_sec=float(getattr(args, "engine_v3_cancel_delay_sec", 5.0)),
                         )
 
                     update_order_model_from_current_ladder(
