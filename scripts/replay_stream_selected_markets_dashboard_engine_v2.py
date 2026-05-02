@@ -2861,6 +2861,111 @@ def _engine_v3_update_cancel_horizon(
         )
 
 
+
+def _engine_v3_get_fallback_exit_from_action_log(
+    *,
+    row: dict[str, object],
+    order: V3Order,
+) -> tuple[float | None, str]:
+    events = globals().get("ENGINE_V3_ACTION_EVENTS") or []
+
+    if not events:
+        import csv
+        from pathlib import Path
+
+        p = Path(str(globals().get("ENGINE_V3_ACTION_LOG_PATH") or "replay/delta_10s/action_log.csv"))
+        loaded: list[dict[str, object]] = []
+
+        if p.exists():
+            with p.open(newline="", encoding="utf-8") as f:
+                for r in csv.DictReader(f):
+                    action = str(r.get("action") or "")
+                    if action not in {"MATCH", "VISIBLE_REMOVE"}:
+                        continue
+                    try:
+                        pt = _engine_v2_ts_ms(str(r.get("utc") or ""))
+                        price = float(r.get("price") or 0.0)
+                        amount = float(r.get("amount") or 0.0)
+                    except Exception:
+                        continue
+                    if pt <= 0 or price <= 1.0 or amount <= 0.0:
+                        continue
+                    loaded.append({
+                        "pt": pt,
+                        "utc": r.get("utc", ""),
+                        "action": action,
+                        "market_type": r.get("market_type", ""),
+                        "market_name": r.get("market_name", ""),
+                        "runner_name": r.get("runner_name", ""),
+                        "side": r.get("side", ""),
+                        "price": price,
+                        "amount": amount,
+                    })
+
+        loaded.sort(key=lambda x: int(x.get("pt") or 0))
+        globals()["ENGINE_V3_ACTION_EVENTS"] = loaded
+        events = loaded
+
+    if not events or order.first_fill_pt <= 0 or order.matched <= 0:
+        return None, ""
+
+    market_type = str(order.market_type or "")
+    market_name = str(order.market_name or "")
+    runner_name = str(order.runner_name or "")
+
+    exit_side = str(row.get("exit_side") or "")
+    if not exit_side:
+        exit_side = "ATL" if str(order.side) == "LAY" else "ATB"
+
+    first_fill_pt = int(order.first_fill_pt)
+    need_amount = float(order.matched)
+
+    for ev in events:
+        try:
+            ev_pt = int(ev.get("pt") or 0)
+            price = float(ev.get("price") or 0.0)
+            amount = float(ev.get("amount") or 0.0)
+        except Exception:
+            continue
+
+        if ev_pt <= first_fill_pt:
+            continue
+        if price <= 1.0 or amount < need_amount:
+            continue
+        if market_type and str(ev.get("market_type") or "") != market_type:
+            continue
+        if market_name and str(ev.get("market_name") or "") != market_name:
+            continue
+        if runner_name and str(ev.get("runner_name") or "") != runner_name:
+            continue
+        if exit_side and str(ev.get("side") or "") != exit_side:
+            continue
+
+        return price, str(ev.get("utc") or "")
+
+    return None, ""
+
+
+def _engine_v3_calc_exit_pnl(
+    *,
+    side: str,
+    entry_price: float,
+    exit_price: float,
+    matched: float,
+) -> float:
+    if matched <= 0.0 or entry_price <= 1.0 or exit_price <= 1.0:
+        return 0.0
+
+    if side == "LAY":
+        return float(matched) * (float(entry_price) - float(exit_price)) / float(exit_price)
+
+    if side == "BACK":
+        return float(matched) * (float(exit_price) - float(entry_price)) / float(entry_price)
+
+    return 0.0
+
+
+
 def _engine_v3_update_exit_settle(
     *,
     pt: int,
@@ -2885,24 +2990,79 @@ def _engine_v3_update_exit_settle(
         if exit_ms <= 0 or pt < exit_ms:
             continue
         if order.first_fill_pt > 0 and exit_ms < int(order.first_fill_pt):
-            if order.late_fill_no_valid_exit_pt <= 0:
-                order.late_fill_no_valid_exit_pt = int(pt)
-                locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
-                bal = 0.0 if balance is None else float(balance)
-                _engine_v3_log_event(
-                    event="LATE_FILL_NO_VALID_EXIT",
-                    pt=pt,
-                    order=order,
-                    signal_id=str(row.get("signal_id") or ""),
-                    liability=_engine_v3_order_liability(order),
-                    free_balance=bal - locked,
-                    pnl_v3=0.0,
-                    matched_fraction=min(1.0, max(0.0, float(order.matched) / float(order.stake))),
-                    exit_utc=str(row.get("exit_utc") or ""),
-                    exit_price=str(row.get("exit_price") or row.get("price") or ""),
-                    settlement="",
-                    note="exit_before_actual_fill",
-                )
+            fallback_exit_price, fallback_exit_utc = _engine_v3_get_fallback_exit_from_action_log(
+                row=row,
+                order=order,
+            )
+
+            if fallback_exit_price is None:
+                if order.late_fill_no_valid_exit_pt <= 0:
+                    order.late_fill_no_valid_exit_pt = int(pt)
+                    locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
+                    bal = 0.0 if balance is None else float(balance)
+                    _engine_v3_log_event(
+                        event="LATE_FILL_NO_VALID_EXIT",
+                        pt=pt,
+                        order=order,
+                        signal_id=str(row.get("signal_id") or ""),
+                        liability=_engine_v3_order_liability(order),
+                        free_balance=bal - locked,
+                        pnl_v3=0.0,
+                        matched_fraction=min(1.0, max(0.0, float(order.matched) / float(order.stake))),
+                        exit_utc=str(row.get("exit_utc") or ""),
+                        exit_price=str(row.get("exit_price") or row.get("price") or ""),
+                        settlement="",
+                        note="exit_before_actual_fill",
+                    )
+                continue
+
+            matched_fraction = min(1.0, max(0.0, float(order.matched) / float(order.stake)))
+            pnl_v3 = _engine_v3_calc_exit_pnl(
+                side=str(order.side),
+                entry_price=float(order.price),
+                exit_price=float(fallback_exit_price),
+                matched=float(order.matched),
+            )
+
+            locked = sum(_engine_v3_order_liability(o) for o in runtime_orders.values() if o.is_active())
+            bal = 0.0 if balance is None else float(balance)
+
+            order.status = OrderStatus.EXITED
+            order.exited_pt = int(pt)
+            order.pnl_v3 = pnl_v3
+
+            _engine_v3_log_event(
+                event="EXIT",
+                pt=pt,
+                order=order,
+                signal_id=str(row.get("signal_id") or ""),
+                liability=_engine_v3_order_liability(order),
+                free_balance=bal - locked,
+                pnl_v3=pnl_v3,
+                matched_fraction=matched_fraction,
+                exit_utc=fallback_exit_utc,
+                exit_price=f"{float(fallback_exit_price):.6f}",
+                settlement="fallback_after_fill",
+                note="fallback_exit_after_fill",
+            )
+
+            order.status = OrderStatus.SETTLED
+            order.settled_pt = int(pt)
+
+            _engine_v3_log_event(
+                event="SETTLE",
+                pt=pt,
+                order=order,
+                signal_id=str(row.get("signal_id") or ""),
+                liability=0.0,
+                free_balance=bal + pnl_v3 - locked,
+                pnl_v3=pnl_v3,
+                matched_fraction=matched_fraction,
+                exit_utc=fallback_exit_utc,
+                exit_price=f"{float(fallback_exit_price):.6f}",
+                settlement="fallback_after_fill",
+                note="settlement=fallback_after_fill",
+            )
             continue
 
         matched_fraction = min(1.0, max(0.0, float(order.matched) / float(order.stake)))
